@@ -13,13 +13,13 @@ Create a child process that doesn't hang the terminal running your script.
 The binary support some configuration options.
 
 * --help
-** Print all options and their description
+    * Print all options and their description
 * --wait
-** Wait for the child process to exit before continuing => --wait
-** Wait for the child process to exit, or timeout after 5000 milliseconds => --wait=5000
+    * Wait for the child process to exit before continuing => --wait
+    * Wait for the child process to exit, or timeout after 5000 milliseconds => --wait=5000
 * --stdin/--stdout/--stderr
-** Bind respective input/output (IO) streams to a file => --stdin=<path-to-file>
-** Bind output stream to another => --stdout=<path-to-logfile> --stderr=stdout
+    * Bind respective input/output (IO) streams to a file => --stdin=<path-to-file>
+    * Bind output stream to another => --stdout=<path-to-logfile> --stderr=stdout
 
 
 ### Run notepad as detached child process
