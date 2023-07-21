@@ -13,6 +13,11 @@ name = "yeet"
 test = false
 bench = false
 
+[[bin]]
+name = "splonk"
+test = false
+bench = false
+
 [dependencies]
 log = "0.4"
 lexopt = "0.3.0"
