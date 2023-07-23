@@ -186,9 +186,9 @@ impl IOHandleMutator {
                 let source = Self::get_io_handle_field_mut(start_info, from).cloned();
                 let target = Self::get_io_handle_field_mut(start_info, to);
                 match (target, source) {
-                    (None, None) | (None, Some(_)) => {
-                        Err(eyre!("Invalid IO reference combination"))
-                    }
+                    (None, _) => Err(eyre!(
+                        "Invalid IO reference combination. This is a programmer's mistake!"
+                    )),
                     (Some(target), None) => {
                         *target = HANDLE::default();
                         Ok(())
@@ -245,7 +245,9 @@ impl IOHandleMutator {
 
                         Ok(())
                     }
-                    None => Err(eyre!("Invalid IO reference")),
+                    None => Err(eyre!(
+                        "Invalid IO reference. This is a programmer's mistake!"
+                    )),
                 }
             }
         }
