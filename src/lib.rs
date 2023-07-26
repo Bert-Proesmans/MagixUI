@@ -12,13 +12,17 @@ use std::{
 };
 
 use thiserror::Error;
-use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, WIN32_ERROR},
-    Security::{
-        GetTokenInformation, TokenGroups, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_GROUPS,
-        TOKEN_INFORMATION_CLASS,
+use windows::{
+    core::PCWSTR,
+    Win32::{
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LUID, WIN32_ERROR},
+        Security::{
+            AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenGroups,
+            LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
+            TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
+        },
+        System::Threading::OpenProcessToken,
     },
-    System::Threading::OpenProcessToken,
 };
 
 pub enum ProcessFlowInstruction<PayloadType> {
@@ -86,6 +90,57 @@ pub fn reconstruct_command_line(components: &Vec<OsString>) -> Option<Vec<u16>> 
 }
 
 #[derive(Error, Debug)]
+pub enum PrivilegeError {
+    #[error(transparent)]
+    Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
+}
+
+pub fn set_privileges(
+    handle: &WrappedHandle,
+    privileges_to_enable: &[PCWSTR],
+) -> Result<(), PrivilegeError> {
+    // Let's not do the funky thing and alloc TOKEN_PRIVILEGES ourselves!
+    // TOKEN_PRIVILEGES is a variable sized structure, but the API mapped it to fixed length with 1
+    // LUID payload.
+    privileges_to_enable
+        .iter()
+        .map(|privilege| set_privilege(handle, privilege))
+        .collect()
+}
+
+pub fn set_privilege(
+    handle: &WrappedHandle,
+    privilege_to_enable: &PCWSTR,
+) -> Result<(), PrivilegeError> {
+    let mut local_uid = LUID::default();
+    unsafe {
+        LookupPrivilegeValueW(None, *privilege_to_enable, addr_of_mut!(local_uid)).ok()?;
+    }
+
+    let privilege_wrapper = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Attributes: SE_PRIVILEGE_ENABLED,
+            Luid: local_uid,
+        }],
+    };
+
+    unsafe {
+        AdjustTokenPrivileges(
+            *handle.get(),
+            false,
+            Some(addr_of!(privilege_wrapper)),
+            0,
+            None,
+            None,
+        )
+        .ok()?;
+    }
+
+    todo!()
+}
+
+#[derive(Error, Debug)]
 pub enum WrappedHandleError {
     #[error("The provided handle into a process is invalid")]
     InvalidProcessHandle,
@@ -101,6 +156,10 @@ pub struct WrappedHandle {
 impl WrappedHandle {
     pub unsafe fn get(&self) -> &HANDLE {
         &self.handle
+    }
+
+    pub unsafe fn new(handle: HANDLE) -> Self {
+        Self { handle }
     }
 
     pub fn from_process(process_handle: HANDLE) -> Result<Self, WrappedHandleError> {

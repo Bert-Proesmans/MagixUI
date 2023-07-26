@@ -3,13 +3,17 @@ use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use magixui::{ProcessFlowInstruction, TokenInformation, WrappedHandle};
+use magixui::{ProcessFlowInstruction, TokenInformation, WrappedHandle, set_privilege};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_EXECUTE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
     TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_READ,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32Next, Process32NextW, PROCESSENTRY32W,
+    TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
@@ -53,7 +57,7 @@ struct Arguments {}
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    target_session_proc(&mut Arguments {})?;
+    target_session_snapshot(&mut Arguments {})?;
 
     todo!();
     match parse_args().wrap_err("During command line arguments parsing")? {
@@ -101,6 +105,34 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
     Ok(ProcessFlowInstruction::Continue(Arguments {}))
 }
 
+fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
+    let snapshot_handle =
+        unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
+
+    set_privilege(handle, privilege_to_enable)
+    let mut current = PROCESSENTRY32W::default();
+    current.dwSize = size_of_val(&current)
+        .try_into()
+        .expect("Integer overflow at PROCESSENTRY32W");
+    unsafe {
+        Process32FirstW(*snapshot_handle.get(), addr_of_mut!(current)).ok()?;
+        loop {
+            dbg!(current.th32ProcessID);
+            dbg!(current.th32ParentProcessID);
+
+            match Process32NextW(*snapshot_handle.get(), addr_of_mut!(current)).ok() {
+                Ok(_) => { /* OK */ }
+                Err(error) => match WIN32_ERROR::from_error(&error) {
+                    Some(ERROR_NO_MORE_FILES) => break,
+                    _ => return Err(error)?,
+                },
+            };
+        }
+    }
+
+    todo!()
+}
+
 fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
     let mut process_ids = Vec::<u32>::with_capacity(1024);
     let available_buffer = (process_ids.capacity() * size_of::<u32>())
@@ -131,6 +163,9 @@ fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u3
 
     for process in process_ids.into_iter() {
         println!("Process {}", process);
+        if process == &0 {
+            continue;
+        }
         let process_handle = unsafe {
             match OpenProcess(PROCESS_QUERY_INFORMATION, false, *process) {
                 Ok(token) => token,
