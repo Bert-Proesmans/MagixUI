@@ -2,14 +2,16 @@ use std::mem::{self, size_of, size_of_val};
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
-use color_eyre::eyre::{eyre, Result, WrapErr};
-use magixui::{enable_privilege, ProcessFlowInstruction, TokenInformation, WrappedHandle, WrappedImpersonation};
+use color_eyre::eyre::{eyre, Result};
+use magixui::{
+    enable_privilege, ProcessFlowInstruction, TokenInformation, WrappedHandle, WrappedImpersonation,
+};
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
-    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, ImpersonateSelf, SECURITY_IMPERSONATION_LEVEL, SecurityImpersonation,
+    SecurityImpersonation, SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -115,46 +117,51 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
     let snapshot_processes =
         unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
 
-
     let mut current = PROCESSENTRY32W::default();
-    current.dwSize = size_of_val(&current)
-        .try_into()
-        .expect("Integer overflow at PROCESSENTRY32W");
+    current.dwSize = size_of_val(&current).try_into().expect("Integer overflow at PROCESSENTRY32W");
     unsafe { Process32FirstW(*snapshot_processes.get(), addr_of_mut!(current)).ok()? };
 
     let mut first = true;
-    loop {        
+    loop {
         // NOTE; Workaround for lack of do-while in Rust syntax.
         if mem::replace(&mut first, false) == false
-        && match unsafe {
-            Process32NextW(*snapshot_processes.get(), addr_of_mut!(current)).ok()
-        } {
-            Ok(_) => {
-                /* Move into next iteration */
-                false
+            && match unsafe {
+                Process32NextW(*snapshot_processes.get(), addr_of_mut!(current)).ok()
+            } {
+                Ok(_) => {
+                    /* Move into next iteration */
+                    false
+                }
+                Err(error) => match WIN32_ERROR::from_error(&error) {
+                    Some(ERROR_NO_MORE_FILES) => true,
+                    _ => Err(error)?,
+                },
             }
-            Err(error) => match WIN32_ERROR::from_error(&error) {
-                Some(ERROR_NO_MORE_FILES) => true,
-                _ => Err(error)?,
-            },
-        }
         {
             break;
         }
-        
+
         dbg!(current.th32ProcessID);
         dbg!(current.th32ParentProcessID);
-        let Ok(target_process) = 
-        WrappedHandle::new_from_external_process(current.th32ProcessID, PROCESS_QUERY_INFORMATION.0)
-        .or_else(|_| WrappedHandle::new_from_external_process(current.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION.0))
-        else {
+        let Ok(target_process) = WrappedHandle::new_from_external_process(
+            current.th32ProcessID,
+            PROCESS_QUERY_INFORMATION.0,
+        )
+        .or_else(|_| {
+            WrappedHandle::new_from_external_process(
+                current.th32ProcessID,
+                PROCESS_QUERY_LIMITED_INFORMATION.0,
+            )
+        }) else {
             continue;
         };
 
         let desired_process_token_access =
             TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
-        let Ok(target_process_token) = target_process.new_token(desired_process_token_access.0)
-        .or_else(|_| target_process.new_token((desired_process_token_access & !TOKEN_QUERY_SOURCE).0))
+        let Ok(target_process_token) =
+            target_process.new_token(desired_process_token_access.0).or_else(|_| {
+                target_process.new_token((desired_process_token_access & !TOKEN_QUERY_SOURCE).0)
+            })
         else {
             continue;
         };
@@ -184,12 +191,8 @@ fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u3
     let mut consumed_buffer = 0;
 
     unsafe {
-        EnumProcesses(
-            process_ids.as_mut_ptr(),
-            available_buffer,
-            addr_of_mut!(consumed_buffer),
-        )
-        .ok()?;
+        EnumProcesses(process_ids.as_mut_ptr(), available_buffer, addr_of_mut!(consumed_buffer))
+            .ok()?;
     }
 
     if available_buffer == consumed_buffer {
@@ -199,10 +202,7 @@ fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u3
     let filled_items = consumed_buffer as usize / size_of::<u32>();
     let process_ids: &[u32] = unsafe { from_raw_parts(process_ids.as_ptr().cast(), filled_items) };
 
-    println!(
-        "Process IDs: {:?}",
-        process_ids.iter().take(10).collect::<Vec<_>>()
-    );
+    println!("Process IDs: {:?}", process_ids.iter().take(10).collect::<Vec<_>>());
 
     for process in process_ids.into_iter() {
         println!("Process {}", process);

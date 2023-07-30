@@ -1,0 +1,6 @@
+# I can't rely on contributors using .editorconfig
+newline_style = "Unix"
+# Max to use the 100 char width for everything or Default. See https://rust-lang.github.io/rustfmt/?version=v1.4.38&search=#use_small_heuristics
+use_small_heuristics = "Max"
+# code can be 100 characters, why not comments?
+comment_width = 100

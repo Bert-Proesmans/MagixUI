@@ -47,10 +47,8 @@ fn should_quote_string(string: &OsStr) -> bool {
         return false;
     }
 
-    let has_spaces = string_bytes[..]
-        .windows(_space.len())
-        .position(|window| *window == *_space)
-        .is_some();
+    let has_spaces =
+        string_bytes[..].windows(_space.len()).position(|window| *window == *_space).is_some();
     let start_quotation = string_bytes[.._quotation_mark.len()] == *_quotation_mark;
     let end_quotation =
         string_bytes[(string_bytes.len() - _quotation_mark.len())..] == *_quotation_mark;
@@ -65,23 +63,15 @@ pub fn reconstruct_command_line(components: &Vec<OsString>) -> Option<Vec<u16>> 
 
     let reconstructed: Vec<_> = components
         .iter()
-        .fold(
-            OsString::with_capacity(expected_length),
-            |mut collector, component| {
-                if should_quote_string(&component) {
-                    collector.extend([
-                        _quotation_mark,
-                        component.as_os_str(),
-                        _quotation_mark,
-                        _space,
-                    ]);
-                } else {
-                    collector.extend([component.as_os_str(), _space]);
-                }
+        .fold(OsString::with_capacity(expected_length), |mut collector, component| {
+            if should_quote_string(&component) {
+                collector.extend([_quotation_mark, component.as_os_str(), _quotation_mark, _space]);
+            } else {
+                collector.extend([component.as_os_str(), _space]);
+            }
 
-                collector
-            },
-        )
+            collector
+        })
         .encode_wide()
         .chain(Some(0))
         .collect();
@@ -148,10 +138,7 @@ pub fn enable_privileges(
     // Let's not do the funky thing and alloc TOKEN_PRIVILEGES ourselves!
     // TOKEN_PRIVILEGES is a variable sized structure, but the API mapped it to fixed length with 1
     // LUID payload.
-    privileges_to_enable
-        .iter()
-        .map(|privilege| enable_privilege(token, privilege))
-        .collect()
+    privileges_to_enable.iter().map(|privilege| enable_privilege(token, privilege)).collect()
 }
 
 pub fn enable_privilege(
@@ -251,19 +238,13 @@ pub struct WrappedHandle<Token = ()> {
 
 impl WrappedHandle {
     pub unsafe fn new(handle: HANDLE) -> Self {
-        Self {
-            handle,
-            _phantom: PhantomData,
-        }
+        Self { handle, _phantom: PhantomData }
     }
 
     pub fn new_from_current_process() -> Result<WrappedHandle<Process>, WrappedHandleError> {
         let handle = unsafe { GetCurrentProcess() };
 
-        Ok(WrappedHandle {
-            handle,
-            _phantom: PhantomData,
-        })
+        Ok(WrappedHandle { handle, _phantom: PhantomData })
     }
 
     pub fn new_from_external_process(
@@ -271,17 +252,10 @@ impl WrappedHandle {
         process_access_rights: u32,
     ) -> Result<WrappedHandle<Process>, WrappedHandleError> {
         let handle = unsafe {
-            OpenProcess(
-                PROCESS_ACCESS_RIGHTS(process_access_rights),
-                false,
-                process_id,
-            )?
+            OpenProcess(PROCESS_ACCESS_RIGHTS(process_access_rights), false, process_id)?
         };
 
-        Ok(WrappedHandle {
-            handle,
-            _phantom: PhantomData,
-        })
+        Ok(WrappedHandle { handle, _phantom: PhantomData })
     }
 
     pub fn new_from_current_thread() -> Result<WrappedHandle<Thread>, WrappedHandleError> {
@@ -289,10 +263,7 @@ impl WrappedHandle {
         // But calling CloseHandle on this handle is a noop, so no issues.
         let handle = unsafe { GetCurrentThread() };
 
-        Ok(WrappedHandle {
-            handle,
-            _phantom: PhantomData,
-        })
+        Ok(WrappedHandle { handle, _phantom: PhantomData })
     }
 }
 
@@ -325,10 +296,7 @@ impl WrappedHandle<Process> {
             }
         };
 
-        Ok(WrappedHandle {
-            handle,
-            _phantom: PhantomData,
-        })
+        Ok(WrappedHandle { handle, _phantom: PhantomData })
     }
 }
 
@@ -351,10 +319,7 @@ impl WrappedHandle<Thread> {
             .ok()?
         };
 
-        Ok(WrappedHandle {
-            handle,
-            _phantom: PhantomData,
-        })
+        Ok(WrappedHandle { handle, _phantom: PhantomData })
     }
 }
 
@@ -422,10 +387,7 @@ impl<Class: TokenClass> TokenInformation<Class> {
             .ok()?;
         }
 
-        Ok(Self {
-            info_buffer,
-            _phantom: PhantomData::default(),
-        })
+        Ok(Self { info_buffer, _phantom: PhantomData::default() })
     }
 }
 

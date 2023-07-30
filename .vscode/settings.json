@@ -1,6 +1,10 @@
 {
-    "[rust]": {
-      "editor.formatOnSave": true,
-      "editor.defaultFormatter": "rust-lang.rust-analyzer"
-    },
+  "[rust]": {
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  // if let(..) else formatting is only available on the nightly rustfmt build.
+  "rust-analyzer.rustfmt.extraArgs": [
+    "+nightly"
+  ],
 }

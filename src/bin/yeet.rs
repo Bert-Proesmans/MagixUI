@@ -165,14 +165,8 @@ enum MutationOrder {
 }
 
 enum IOHandleMutator {
-    FromReference {
-        to: InputOutputReference,
-        from: InputOutputReference,
-    },
-    FromFilepath {
-        to: InputOutputReference,
-        path: OsString,
-    },
+    FromReference { to: InputOutputReference, from: InputOutputReference },
+    FromFilepath { to: InputOutputReference, path: OsString },
 }
 
 impl IOHandleMutator {
@@ -216,11 +210,7 @@ impl IOHandleMutator {
                     let handle = CreateFileW(
                         // NOTE; Handles relative paths just fine.
                         PCWSTR::from_raw(filename.as_ptr()),
-                        if read_access {
-                            FILE_GENERIC_READ.0
-                        } else {
-                            FILE_GENERIC_WRITE.0
-                        },
+                        if read_access { FILE_GENERIC_READ.0 } else { FILE_GENERIC_WRITE.0 },
                         FILE_SHARE_READ | FILE_SHARE_WRITE,
                         Some(security_attributes as *const _),
                         OPEN_ALWAYS,
@@ -245,9 +235,7 @@ impl IOHandleMutator {
 
                         Ok(())
                     }
-                    None => Err(eyre!(
-                        "Invalid IO reference. This is a programmer's mistake!"
-                    )),
+                    None => Err(eyre!("Invalid IO reference. This is a programmer's mistake!")),
                 }
             }
         }
