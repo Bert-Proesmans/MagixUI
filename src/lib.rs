@@ -120,7 +120,12 @@ impl ImpersonationGuard {
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
         if mem::replace(&mut self.dropped, true) == false {
-            unsafe { RevertToSelf() };
+            if let Err(error) = unsafe { RevertToSelf().ok() } {
+                panic!(
+                    "RevertToSelf call failed, aborting thread now! Error message {0}",
+                    error.message()
+                );
+            }
         }
     }
 }

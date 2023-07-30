@@ -107,7 +107,7 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
 }
 
 fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
-    let guard = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
+    let impersonation = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
 
     let current_thread = WrappedHandle::new_from_current_thread()?;
     let thread_token =
@@ -166,6 +166,7 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
             continue;
         };
 
+        // TODO; Filter processes for target session.
         let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&target_process_token)?;
         for group in groups_info.get_groups() {
             let sid_string = unsafe {
@@ -179,7 +180,7 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
         return Ok(0);
     }
 
-    guard.revert()?;
+    impersonation.revert()?;
     Err(eyre!("Not found"))
 }
 
