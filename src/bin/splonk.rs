@@ -1,26 +1,25 @@
-use std::mem::{size_of, size_of_val};
+use std::mem::{self, size_of, size_of_val};
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use magixui::{ProcessFlowInstruction, TokenInformation, WrappedHandle, set_privilege};
+use magixui::{enable_privilege, ProcessFlowInstruction, TokenInformation, WrappedHandle, WrappedImpersonation};
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_EXECUTE, TOKEN_GROUPS, TOKEN_IMPERSONATE,
-    TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_READ,
+    SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, ImpersonateSelf, SECURITY_IMPERSONATION_LEVEL, SecurityImpersonation,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32Next, Process32NextW, PROCESSENTRY32W,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSFreeMemory, WTSGetActiveConsoleSessionId,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::{
     RemoteDesktop::{WTSEnumerateSessionsW, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW},
@@ -60,19 +59,19 @@ fn main() -> Result<()> {
     target_session_snapshot(&mut Arguments {})?;
 
     todo!();
-    match parse_args().wrap_err("During command line arguments parsing")? {
-        ProcessFlowInstruction::Terminate => return Ok(()),
-        ProcessFlowInstruction::Continue(mut arguments) => {
-            match target_session_proc(&mut arguments).wrap_err("During logon session select")? {
-                ProcessFlowInstruction::Terminate => return Ok(()),
-                ProcessFlowInstruction::Continue(_) => {
-                    match launch_process(arguments).wrap_err("During child process setup")? {
-                        _ => Ok(()),
-                    }
-                }
-            }
-        }
-    }
+    // match parse_args().wrap_err("During command line arguments parsing")? {
+    //     ProcessFlowInstruction::Terminate => return Ok(()),
+    //     ProcessFlowInstruction::Continue(mut arguments) => {
+    //         match target_session_proc(&mut arguments).wrap_err("During logon session select")? {
+    //             ProcessFlowInstruction::Terminate => return Ok(()),
+    //             ProcessFlowInstruction::Continue(_) => {
+    //                 match launch_process(arguments).wrap_err("During child process setup")? {
+    //                     _ => Ok(()),
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
 }
 
 fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
@@ -106,31 +105,75 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
 }
 
 fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
-    let snapshot_handle =
+    let guard = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
+
+    let current_thread = WrappedHandle::new_from_current_thread()?;
+    let thread_token =
+        current_thread.new_token((TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY).0, false)?;
+    enable_privilege(&thread_token, &SE_DEBUG_NAME)?;
+
+    let snapshot_processes =
         unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
 
-    set_privilege(handle, privilege_to_enable)
+
     let mut current = PROCESSENTRY32W::default();
     current.dwSize = size_of_val(&current)
         .try_into()
         .expect("Integer overflow at PROCESSENTRY32W");
-    unsafe {
-        Process32FirstW(*snapshot_handle.get(), addr_of_mut!(current)).ok()?;
-        loop {
-            dbg!(current.th32ProcessID);
-            dbg!(current.th32ParentProcessID);
+    unsafe { Process32FirstW(*snapshot_processes.get(), addr_of_mut!(current)).ok()? };
 
-            match Process32NextW(*snapshot_handle.get(), addr_of_mut!(current)).ok() {
-                Ok(_) => { /* OK */ }
-                Err(error) => match WIN32_ERROR::from_error(&error) {
-                    Some(ERROR_NO_MORE_FILES) => break,
-                    _ => return Err(error)?,
-                },
-            };
+    let mut first = true;
+    loop {        
+        // NOTE; Workaround for lack of do-while in Rust syntax.
+        if mem::replace(&mut first, false) == false
+        && match unsafe {
+            Process32NextW(*snapshot_processes.get(), addr_of_mut!(current)).ok()
+        } {
+            Ok(_) => {
+                /* Move into next iteration */
+                false
+            }
+            Err(error) => match WIN32_ERROR::from_error(&error) {
+                Some(ERROR_NO_MORE_FILES) => true,
+                _ => Err(error)?,
+            },
         }
+        {
+            break;
+        }
+        
+        dbg!(current.th32ProcessID);
+        dbg!(current.th32ParentProcessID);
+        let Ok(target_process) = 
+        WrappedHandle::new_from_external_process(current.th32ProcessID, PROCESS_QUERY_INFORMATION.0)
+        .or_else(|_| WrappedHandle::new_from_external_process(current.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION.0))
+        else {
+            continue;
+        };
+
+        let desired_process_token_access =
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+        let Ok(target_process_token) = target_process.new_token(desired_process_token_access.0)
+        .or_else(|_| target_process.new_token((desired_process_token_access & !TOKEN_QUERY_SOURCE).0))
+        else {
+            continue;
+        };
+
+        let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&target_process_token)?;
+        for group in groups_info.get_groups() {
+            let sid_string = unsafe {
+                let mut wide_string = PWSTR::null();
+                ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
+                String::from_utf16_lossy(wide_string.as_wide())
+            };
+            println!("{sid_string}");
+        }
+
+        return Ok(0);
     }
 
-    todo!()
+    guard.revert()?;
+    Err(eyre!("Not found"))
 }
 
 fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
@@ -166,14 +209,13 @@ fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u3
         if process == &0 {
             continue;
         }
-        let process_handle = unsafe {
-            match OpenProcess(PROCESS_QUERY_INFORMATION, false, *process) {
-                Ok(token) => token,
-                Err(_) => OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, *process)?,
-            }
-        };
+        // let process_handle = unsafe {
+        //     match OpenProcess(PROCESS_QUERY_INFORMATION, false, *process) {
+        //         Ok(token) => token,
+        //         Err(_) => OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, *process)?,
+        //     }
+        // };
 
-        println!("Process ID: {0}", process_handle.0);
         // let mut process_token = HANDLE::default();
         // unsafe {
         //     OpenProcessToken(
@@ -189,17 +231,17 @@ fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u3
         //     )
         //     .ok()?
         // };
-        let process_token = WrappedHandle::from_process(process_handle)?;
+        let process_token = WrappedHandle::new_from_current_process()?;
 
-        let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&process_token)?;
-        for group in groups_info.get_groups() {
-            let sid_string = unsafe {
-                let mut wide_string = PWSTR::null();
-                ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
-                String::from_utf16_lossy(wide_string.as_wide())
-            };
-            println!("{sid_string}");
-        }
+        // let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&process_token)?;
+        // for group in groups_info.get_groups() {
+        //     let sid_string = unsafe {
+        //         let mut wide_string = PWSTR::null();
+        //         ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
+        //         String::from_utf16_lossy(wide_string.as_wide())
+        //     };
+        //     println!("{sid_string}");
+        // }
 
         println!();
     }

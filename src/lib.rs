@@ -2,26 +2,32 @@
 compile_error!("This project only works on Windows systems!");
 
 use std::{
-    alloc::Layout,
     ffi::{OsStr, OsString},
     marker::PhantomData,
-    mem::size_of_val,
+    mem::{self, size_of},
     os::windows::prelude::OsStrExt,
     ptr::{addr_of, addr_of_mut},
-    slice::{from_raw_parts, from_raw_parts_mut},
+    slice::from_raw_parts,
 };
 
 use thiserror::Error;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LUID, WIN32_ERROR},
-        Security::{
-            AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenGroups,
-            LUID_AND_ATTRIBUTES, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-            TOKEN_ALL_ACCESS, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
+        Foundation::{
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_TOKEN,
+            HANDLE, LUID, WIN32_ERROR,
         },
-        System::Threading::OpenProcessToken,
+        Security::{
+            AdjustTokenPrivileges, GetTokenInformation, ImpersonateSelf, LookupPrivilegeValueW,
+            RevertToSelf, TokenGroups, LUID_AND_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
+            SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_GROUPS,
+            TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
+        },
+        System::Threading::{
+            GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+            PROCESS_ACCESS_RIGHTS,
+        },
     },
 };
 
@@ -90,13 +96,53 @@ pub fn reconstruct_command_line(components: &Vec<OsString>) -> Option<Vec<u16>> 
 }
 
 #[derive(Error, Debug)]
+pub enum ImpersonationError {
+    #[error(transparent)]
+    Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
+}
+
+pub struct WrappedImpersonation;
+pub struct ImpersonationGuard {
+    dropped: bool,
+}
+
+impl WrappedImpersonation {
+    pub fn impersonate_self(
+        impersonation_level: i32,
+    ) -> Result<ImpersonationGuard, ImpersonationError> {
+        match unsafe { ImpersonateSelf(SECURITY_IMPERSONATION_LEVEL(impersonation_level)).ok() } {
+            Ok(_) => Ok(ImpersonationGuard { dropped: false }),
+            Err(error) => Err(error)?,
+        }
+    }
+}
+
+impl ImpersonationGuard {
+    pub fn revert(mut self) -> Result<(), ImpersonationError> {
+        if mem::replace(&mut self.dropped, true) == false {
+            unsafe { RevertToSelf().ok()? };
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for ImpersonationGuard {
+    fn drop(&mut self) {
+        if mem::replace(&mut self.dropped, true) == false {
+            unsafe { RevertToSelf() };
+        }
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum PrivilegeError {
     #[error(transparent)]
     Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
 }
 
-pub fn set_privileges(
-    handle: &WrappedHandle,
+pub fn enable_privileges(
+    token: &WrappedHandle<ThreadToken>,
     privileges_to_enable: &[PCWSTR],
 ) -> Result<(), PrivilegeError> {
     // Let's not do the funky thing and alloc TOKEN_PRIVILEGES ourselves!
@@ -104,26 +150,68 @@ pub fn set_privileges(
     // LUID payload.
     privileges_to_enable
         .iter()
-        .map(|privilege| set_privilege(handle, privilege))
+        .map(|privilege| enable_privilege(token, privilege))
         .collect()
 }
 
-pub fn set_privilege(
-    handle: &WrappedHandle,
+pub fn enable_privilege(
+    token: &WrappedHandle<ThreadToken>,
     privilege_to_enable: &PCWSTR,
 ) -> Result<(), PrivilegeError> {
-    let mut local_uid = LUID::default();
-    unsafe {
-        LookupPrivilegeValueW(None, *privilege_to_enable, addr_of_mut!(local_uid)).ok()?;
-    }
-
-    let privilege_wrapper = TOKEN_PRIVILEGES {
+    let mut privilege_wrapper = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Attributes: SE_PRIVILEGE_ENABLED,
-            Luid: local_uid,
+            Luid: Default::default(),
         }],
     };
+
+    unsafe {
+        LookupPrivilegeValueW(
+            None,
+            *privilege_to_enable,
+            addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
+        )
+        .ok()?;
+    }
+
+    unsafe {
+        AdjustTokenPrivileges(
+            *token.get(),
+            false,
+            Some(addr_of!(privilege_wrapper)),
+            0,
+            None,
+            None,
+        )
+        .ok()?;
+    }
+
+    // TODO; Check WinLastError again!
+
+    Ok(())
+}
+
+pub fn disable_privilege(
+    handle: &WrappedHandle,
+    privilege_to_enable: &PCWSTR,
+) -> Result<(), PrivilegeError> {
+    let mut privilege_wrapper = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Attributes: Default::default(), // <- Disable privilege
+            Luid: Default::default(),
+        }],
+    };
+
+    unsafe {
+        LookupPrivilegeValueW(
+            None,
+            *privilege_to_enable,
+            addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
+        )
+        .ok()?;
+    }
 
     unsafe {
         AdjustTokenPrivileges(
@@ -137,47 +225,142 @@ pub fn set_privilege(
         .ok()?;
     }
 
-    todo!()
+    // TODO; Check WinLastError again!
+
+    Ok(())
 }
 
 #[derive(Error, Debug)]
 pub enum WrappedHandleError {
-    #[error("The provided handle into a process is invalid")]
-    InvalidProcessHandle,
+    #[error("You tried retrieving the impersonating token from a thread, but none was set")]
+    NoThreadTokenSet,
 
     #[error(transparent)]
     Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
 }
 
-pub struct WrappedHandle {
+pub struct Process;
+pub struct ProcessToken;
+pub struct Thread;
+pub struct ThreadToken;
+
+pub struct WrappedHandle<Token = ()> {
     handle: HANDLE,
+    _phantom: PhantomData<Token>,
 }
 
 impl WrappedHandle {
-    pub unsafe fn get(&self) -> &HANDLE {
-        &self.handle
-    }
-
     pub unsafe fn new(handle: HANDLE) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            _phantom: PhantomData,
+        }
     }
 
-    pub fn from_process(process_handle: HANDLE) -> Result<Self, WrappedHandleError> {
-        if process_handle.is_invalid() {
-            return Err(WrappedHandleError::InvalidProcessHandle);
-        }
+    pub fn new_from_current_process() -> Result<WrappedHandle<Process>, WrappedHandleError> {
+        let handle = unsafe { GetCurrentProcess() };
 
-        let mut handle: HANDLE = Default::default();
-        unsafe {
-            match OpenProcessToken(process_handle, TOKEN_ALL_ACCESS, addr_of_mut!(handle)).ok() {
-                Ok(_) => Ok(Self { handle }),
-                Err(error) => Err(WrappedHandleError::Other(error)),
-            }
-        }
+        Ok(WrappedHandle {
+            handle,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub fn new_from_external_process(
+        process_id: u32,
+        process_access_rights: u32,
+    ) -> Result<WrappedHandle<Process>, WrappedHandleError> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_ACCESS_RIGHTS(process_access_rights),
+                false,
+                process_id,
+            )?
+        };
+
+        Ok(WrappedHandle {
+            handle,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub fn new_from_current_thread() -> Result<WrappedHandle<Thread>, WrappedHandleError> {
+        // WARN; Thread handle doesn't need closing! It's a so called pseudo handle.
+        // But calling CloseHandle on this handle is a noop, so no issues.
+        let handle = unsafe { GetCurrentThread() };
+
+        Ok(WrappedHandle {
+            handle,
+            _phantom: PhantomData,
+        })
     }
 }
 
-impl Drop for WrappedHandle {
+impl<Token> WrappedHandle<Token> {
+    pub unsafe fn get(&self) -> &HANDLE {
+        &self.handle
+    }
+}
+
+impl WrappedHandle<Process> {
+    pub fn new_token(
+        &self,
+        token_access_rights: u32,
+    ) -> Result<WrappedHandle<ProcessToken>, WrappedHandleError> {
+        let mut handle: HANDLE = Default::default();
+        unsafe {
+            if let Err(error) = OpenProcessToken(
+                self.handle,
+                TOKEN_ACCESS_MASK(token_access_rights),
+                addr_of_mut!(handle),
+            )
+            .ok()
+            {
+                match WIN32_ERROR::from_error(&error) {
+                    Some(ERROR_NO_TOKEN) | Some(ERROR_NO_IMPERSONATION_TOKEN) => {
+                        Err(WrappedHandleError::NoThreadTokenSet)?
+                    }
+                    _ => Err(error)?,
+                }
+            }
+        };
+
+        Ok(WrappedHandle {
+            handle,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl WrappedHandle<ProcessToken> {}
+
+impl WrappedHandle<Thread> {
+    pub fn new_token(
+        &self,
+        token_access_rights: u32,
+        open_with_impersonation: bool,
+    ) -> Result<WrappedHandle<ThreadToken>, WrappedHandleError> {
+        let mut handle: HANDLE = Default::default();
+        unsafe {
+            OpenThreadToken(
+                self.handle,
+                TOKEN_ACCESS_MASK(token_access_rights),
+                !open_with_impersonation,
+                addr_of_mut!(handle),
+            )
+            .ok()?
+        };
+
+        Ok(WrappedHandle {
+            handle,
+            _phantom: PhantomData,
+        })
+    }
+}
+
+impl WrappedHandle<ThreadToken> {}
+
+impl<Token> Drop for WrappedHandle<Token> {
     fn drop(&mut self) {
         // SAFETY; Safe because this wrapper only stores unique and valid handles created within.
         unsafe { CloseHandle(self.handle) };
@@ -205,15 +388,13 @@ pub struct TokenInformation<Token> {
     _phantom: PhantomData<Token>,
 }
 
-impl<Token: TokenClass> TokenInformation<Token> {
-    pub fn new(handle: &WrappedHandle) -> Result<Self, TokenInformationError> {
-        let handle = unsafe { handle.get() };
-
+impl<Class: TokenClass> TokenInformation<Class> {
+    pub fn new(handle: &WrappedHandle<ProcessToken>) -> Result<Self, TokenInformationError> {
         let mut required_size = 0;
         unsafe {
             match GetTokenInformation(
-                handle.clone(),
-                Token::class(),
+                *handle.get(),
+                Class::class(),
                 None,
                 0,
                 addr_of_mut!(required_size),
@@ -232,10 +413,10 @@ impl<Token: TokenClass> TokenInformation<Token> {
         required_size = 0;
         unsafe {
             GetTokenInformation(
-                handle.clone(),
-                Token::class(),
+                *handle.get(),
+                Class::class(),
                 Some(info_buffer.as_mut_ptr().cast()),
-                size_of_val(info_buffer.as_slice()) as _,
+                (info_buffer.capacity() * size_of::<u8>()) as _,
                 addr_of_mut!(required_size),
             )
             .ok()?;
@@ -248,11 +429,11 @@ impl<Token: TokenClass> TokenInformation<Token> {
     }
 }
 
-impl<Token> AsRef<Token> for TokenInformation<Token> {
-    fn as_ref(&self) -> &Token {
+impl<Class> AsRef<Class> for TokenInformation<Class> {
+    fn as_ref(&self) -> &Class {
         // SAFETY; Safe because object construction is bound to generic argument and the buffer is
         // completely abstracted behind a type interface.
-        let info: &[Token] = unsafe { from_raw_parts(self.info_buffer.as_ptr().cast(), 1) };
+        let info: &[Class] = unsafe { from_raw_parts(self.info_buffer.as_ptr().cast(), 1) };
         &info[0]
     }
 }
@@ -272,6 +453,6 @@ impl TokenInformation<TOKEN_GROUPS> {
     pub fn get_groups(&self) -> &[SID_AND_ATTRIBUTES] {
         let object = self.as_ref();
         // SAFETY; Safe because Groups is a valid aligned pointer, and GroupCount came from the OS.
-        unsafe { from_raw_parts(addr_of!(object.Groups[0]), object.GroupCount as _) }
+        unsafe { from_raw_parts(object.Groups.as_ptr(), object.GroupCount as _) }
     }
 }
