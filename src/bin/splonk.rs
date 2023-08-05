@@ -1,17 +1,19 @@
+use std::ffi::OsString;
 use std::mem::{self, size_of, size_of_val};
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
-use color_eyre::eyre::{eyre, Result};
+use color_eyre::eyre::{eyre, Context, Result};
 use magixui::{
     enable_privilege, ProcessFlowInstruction, TokenInformation, WrappedHandle, WrappedImpersonation,
 };
+use thiserror::Error;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
     SecurityImpersonation, SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE,
+    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_USER,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -33,54 +35,174 @@ macro_rules! HELP {
 "\
 Magix Tada
 
-Launch a child process into a different user logon session, window station, desktop than the parent process is currently using.
+Launch a child process into a different user logon session->window station->desktop than the parent process is currently using.
 
 USAGE:
-    {bin_name} [FLAGS] [OPTIONS] -- ProcessPath ProcessArgument1 ProcessArgument2 ProcessArgumentN
+    {bin_name} [SWITCHES] [FLAGS] [| [user UserName] [process ProcessName] ] -- ProcessPath ProcessArgument1 ProcessArgument2 ProcessArgumentN
+
+SWITCHES:
+    --help                          Prints help information and exits
+    -w, --wait                      Wait for the child process to exit before continuing
 
 FLAGS:
-    --help                          Prints help information and exits
-    -w, --wait[=milliseconds]       Wait for the child process to exit before continuing, optionally wait for a provided amount of milliseconds
+    -w, --wait=milliseconds         Wait for the child process to exit before continuing, but no longer than the provided amount of milliseconds
+    -p, --process=processName       The target session must have a process running which image-name property equals the provided processName
 
-OPTIONS:
-    # None yet
+SUBCOMMANDS:
+    user                            Find the target desktop by comparing user identifiers
+    process                         Find the target desktop by comparing running processes
 
 ARGS:
-    --                              Argument splitter
-    ProcessPath       PATH          The location of the process to execute
-    ProcessArgumentN  STRING        Arguments passed to the proces on start
+    [IF user]       UserName            STRING      The username of the user that is owner of the session to target
+    [IF process]    ProcessName         STRING      The name of the process that is owned by the session to target
+                    --                              Argument splitter
+                    ProcessPath         PATH        The location of the process to execute
+                    ProcessArgumentN    STRING      Arguments passed to the proces on start
 "
     };
 }
 
-struct Arguments {}
+enum OperationMode {
+    User { user_name: OsString },
+    Process { process_name: OsString },
+}
+
+enum OperationModeBuilder {
+    None,
+    UserBuilder { user_name: Option<OsString> },
+    ProcessBuilder { process_name: Option<OsString> },
+}
+
+#[derive(Error, Debug)]
+enum OperationModeBuilderError {
+    #[error("The argument {0:?} is not a recognized command")]
+    UnknownCommand(String),
+
+    #[error("No subcommand was provided")]
+    NoCommand,
+
+    #[error("Argument {1:?} is missing for subcommand {0:?}")]
+    IncompleteCommand(String, String),
+
+    #[error("The argument {0:?} was unexpected in this position, for the given command")]
+    ArgumentUnexpected(OsString),
+}
+
+impl OperationModeBuilder {
+    pub fn new() -> OperationModeBuilder {
+        OperationModeBuilder::None
+    }
+
+    pub fn can_consume(&self) -> bool {
+        match self {
+            Self::UserBuilder { user_name } if user_name.is_some() => false,
+            Self::ProcessBuilder { process_name } if process_name.is_some() => false,
+            _ => true,
+        }
+    }
+
+    pub fn build(self) -> Result<OperationMode, OperationModeBuilderError> {
+        match self {
+            OperationModeBuilder::None => Err(OperationModeBuilderError::NoCommand),
+            OperationModeBuilder::UserBuilder { user_name } => {
+                if let Some(user_name) = user_name {
+                    Ok(OperationMode::User { user_name })
+                } else {
+                    Err(OperationModeBuilderError::IncompleteCommand(
+                        String::from("user"),
+                        String::from("user_name"),
+                    ))
+                }
+            }
+            OperationModeBuilder::ProcessBuilder { process_name } => {
+                if let Some(process_name) = process_name {
+                    Ok(OperationMode::Process { process_name })
+                } else {
+                    Err(OperationModeBuilderError::IncompleteCommand(
+                        String::from("process"),
+                        String::from("process_name"),
+                    ))
+                }
+            }
+        }
+    }
+
+    pub fn push(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
+        match self {
+            Self::None => self.replace_self(argument),
+            Self::UserBuilder { .. } => self.push_userbuilder(argument),
+            Self::ProcessBuilder { .. } => self.push_processbuilder(argument),
+        }
+    }
+
+    fn replace_self(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
+        if let Self::None = self {
+            match argument.to_string_lossy() {
+                std::borrow::Cow::Borrowed(str) => match str {
+                    "user" => {
+                        let _ = mem::replace(self, Self::UserBuilder { user_name: None });
+                        Ok(())
+                    }
+                    "process" => {
+                        let _ = mem::replace(self, Self::ProcessBuilder { process_name: None });
+                        Ok(())
+                    }
+                    _ => Err(OperationModeBuilderError::UnknownCommand(str.to_owned()))?,
+                },
+                _ => {
+                    Err(OperationModeBuilderError::UnknownCommand(String::from("[Decode error]")))?
+                }
+            }
+        } else {
+            unreachable!("Programmer OOPSIE");
+        }
+    }
+
+    fn push_userbuilder(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
+        let Self::UserBuilder { user_name } = self else { unreachable!("Developer OOPSIE") };
+        match (&user_name,) {
+            (None, ..) => {
+                let _ = mem::replace(user_name, Some(argument));
+                Ok(())
+            }
+            (Some(_), ..) => Err(OperationModeBuilderError::ArgumentUnexpected(argument))?,
+        }
+    }
+
+    fn push_processbuilder(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
+        todo!()
+    }
+}
+
+struct Arguments {
+    wait_for_child: Option<u32>,
+    mode: OperationMode,
+    command_line: Vec<OsString>,
+}
 
 fn main() -> Result<()> {
     color_eyre::install()?;
 
-    target_session_snapshot(&mut Arguments {})?;
-
-    todo!();
-    // match parse_args().wrap_err("During command line arguments parsing")? {
-    //     ProcessFlowInstruction::Terminate => return Ok(()),
-    //     ProcessFlowInstruction::Continue(mut arguments) => {
-    //         match target_session_proc(&mut arguments).wrap_err("During logon session select")? {
-    //             ProcessFlowInstruction::Terminate => return Ok(()),
-    //             ProcessFlowInstruction::Continue(_) => {
-    //                 match launch_process(arguments).wrap_err("During child process setup")? {
-    //                     _ => Ok(()),
-    //                 }
-    //             }
-    //         }
-    //     }
-    // }
+    match parse_args().wrap_err("During command line arguments parsing")? {
+        ProcessFlowInstruction::Terminate => return Ok(()),
+        ProcessFlowInstruction::Continue(mut arguments) => {
+            match target_session_snapshot(&mut arguments).wrap_err("During logon session select")? {
+                ProcessFlowInstruction::Terminate => return Ok(()),
+                ProcessFlowInstruction::Continue(_) => {
+                    match launch_process(arguments).wrap_err("During child process setup")? {
+                        _ => Ok(()),
+                    }
+                }
+            }
+        }
+    }
 }
 
-fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
+fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
     use lexopt::prelude::*;
     let mut wait_for_child = None;
     let mut command_line = Vec::new();
-    let mut startupinfo_mutators: Vec<u32> = Vec::new();
+    let mut operation_builder = OperationModeBuilder::new();
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
@@ -96,23 +218,39 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>, lexopt::Error> {
                     None => Some(INFINITE),
                 };
             }
+            Value(argument) if operation_builder.can_consume() => {
+                if let Err(error) = operation_builder.push(argument) {
+                    match error {
+                        OperationModeBuilderError::ArgumentUnexpected(argument) => {
+                            Err(lexopt::Arg::Value(argument).unexpected())?
+                        }
+                        _ => Err(error)?,
+                    }
+                };
+            }
             // NOTE; Everything after -- should be copied as is.
             // We will reconstruct the commandline string from these parts and pass into StartProcess
             Value(argument) => command_line.push(argument),
-            _ => return Err(arg.unexpected()),
+            _ => Err(arg.unexpected())?,
         }
     }
 
-    Ok(ProcessFlowInstruction::Continue(Arguments {}))
+    Ok(ProcessFlowInstruction::Continue(Arguments {
+        wait_for_child,
+        command_line,
+        mode: operation_builder.build()?,
+    }))
 }
 
-fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
+fn target_session_snapshot(args: &mut Arguments) -> Result<ProcessFlowInstruction<()>> {
     let impersonation = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
 
     let current_thread = WrappedHandle::new_from_current_thread()?;
     let thread_token =
         current_thread.new_token((TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY).0, false)?;
-    enable_privilege(&thread_token, &SE_DEBUG_NAME)?;
+    unsafe {
+        enable_privilege(&thread_token, SE_DEBUG_NAME)?;
+    }
 
     let snapshot_processes =
         unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
@@ -141,8 +279,6 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
             break;
         }
 
-        dbg!(current.th32ProcessID);
-        dbg!(current.th32ParentProcessID);
         let Ok(target_process) = WrappedHandle::new_from_external_process(
             current.th32ProcessID,
             PROCESS_QUERY_INFORMATION.0,
@@ -166,18 +302,26 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<u32> {
             continue;
         };
 
-        // TODO; Filter processes for target session.
-        let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&target_process_token)?;
-        for group in groups_info.get_groups() {
-            let sid_string = unsafe {
-                let mut wide_string = PWSTR::null();
-                ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
-                String::from_utf16_lossy(wide_string.as_wide())
-            };
-            println!("{sid_string}");
+        dbg!(current.th32ProcessID);
+        dbg!(current.th32ParentProcessID);
+        {
+            // DEBUG
+            let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&target_process_token)?;
+            for group in groups_info.get_groups() {
+                let sid_string = unsafe {
+                    let mut wide_string = PWSTR::null();
+                    ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
+                    String::from_utf16_lossy(wide_string.as_wide())
+                };
+                println!("{sid_string}");
+            }
         }
 
-        return Ok(0);
+        let user_info = TokenInformation::<TOKEN_USER>::new(&target_process_token)?;
+        let user_sid = user_info.as_ref().User.Sid;
+        // EqualSID
+
+        return Ok(ProcessFlowInstruction::Continue(()));
     }
 
     impersonation.revert()?;

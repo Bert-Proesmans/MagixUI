@@ -12,17 +12,17 @@ use std::{
 
 use thiserror::Error;
 use windows::{
-    core::PCWSTR,
+    core::{Error, PCWSTR},
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_TOKEN,
-            HANDLE, LUID, WIN32_ERROR,
+            CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
+            ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_TOKEN, HANDLE, LUID, WIN32_ERROR,
         },
         Security::{
             AdjustTokenPrivileges, GetTokenInformation, ImpersonateSelf, LookupPrivilegeValueW,
-            RevertToSelf, TokenGroups, LUID_AND_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
-            SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ACCESS_MASK, TOKEN_GROUPS,
-            TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
+            RevertToSelf, TokenGroups, TokenUser, LUID_AND_ATTRIBUTES,
+            SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
+            TOKEN_ACCESS_MASK, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_USER,
         },
         System::Threading::{
             GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
@@ -132,23 +132,36 @@ impl Drop for ImpersonationGuard {
 
 #[derive(Error, Debug)]
 pub enum PrivilegeError {
+    #[error("The provided privilege name '{0}' is unknown.")]
+    InvalidPrivilegeName(String),
+
+    #[error("The privilege with name '{0}' could not be enabled.")]
+    PrivilegeNotEnabled(String),
+
+    #[error("The privilege with name '{0}' could not be disabled.")]
+    PrivilegeNotDisabled(String),
+
     #[error(transparent)]
     Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
 }
 
-pub fn enable_privileges(
+// It pains me to create this leaky interface :s
+// Accepting PCWSTR also means I must make this method unsafe -_-
+pub unsafe fn enable_privileges(
     token: &WrappedHandle<ThreadToken>,
     privileges_to_enable: &[PCWSTR],
 ) -> Result<(), PrivilegeError> {
     // Let's not do the funky thing and alloc TOKEN_PRIVILEGES ourselves!
     // TOKEN_PRIVILEGES is a variable sized structure, but the API mapped it to fixed length with 1
     // LUID payload.
-    privileges_to_enable.iter().map(|privilege| enable_privilege(token, privilege)).collect()
+    privileges_to_enable.iter().map(|privilege| enable_privilege(token, *privilege)).collect()
 }
 
-pub fn enable_privilege(
+// It pains me to create this leaky interface :s
+// Accepting PCWSTR also means I must make this method unsafe -_-
+pub unsafe fn enable_privilege(
     token: &WrappedHandle<ThreadToken>,
-    privilege_to_enable: &PCWSTR,
+    privilege_to_enable: PCWSTR,
 ) -> Result<(), PrivilegeError> {
     let mut privilege_wrapper = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
@@ -158,35 +171,40 @@ pub fn enable_privilege(
         }],
     };
 
-    unsafe {
-        LookupPrivilegeValueW(
-            None,
-            *privilege_to_enable,
-            addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
-        )
-        .ok()?;
-    }
+    LookupPrivilegeValueW(
+        None,
+        privilege_to_enable,
+        addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
+    )
+    .ok()
+    .map_err(|_| {
+        let privilege_string =
+            privilege_to_enable.to_string().unwrap_or_else(|_| "[Decode error]".into());
+        PrivilegeError::InvalidPrivilegeName(privilege_string)
+    })?;
 
     unsafe {
-        AdjustTokenPrivileges(
-            *token.get(),
-            false,
-            Some(addr_of!(privilege_wrapper)),
-            0,
-            None,
-            None,
-        )
-        .ok()?;
+        AdjustTokenPrivileges(*token.get(), false, Some(addr_of!(privilege_wrapper)), 0, None, None)
     }
+    .ok()?;
 
-    // TODO; Check WinLastError again!
+    // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
+    // status of the _request_ but not if all privileges are set. That's why a second test is needed!
+    if Error::from_win32().code() == ERROR_NOT_ALL_ASSIGNED.to_hresult() {
+        // NOTE; No need to reset privileges to consistent state because we update permission 1 by 1.
+        let privilege_string =
+            privilege_to_enable.to_string().unwrap_or_else(|_| "[Decode error]".into());
+        Err(PrivilegeError::PrivilegeNotEnabled(privilege_string))?;
+    }
 
     Ok(())
 }
 
-pub fn disable_privilege(
+// It pains me to create this leaky interface :s
+// Accepting PCWSTR also means I must make this method unsafe -_-
+pub unsafe fn disable_privilege(
     handle: &WrappedHandle,
-    privilege_to_enable: &PCWSTR,
+    privilege_to_disable: PCWSTR,
 ) -> Result<(), PrivilegeError> {
     let mut privilege_wrapper = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
@@ -196,28 +214,24 @@ pub fn disable_privilege(
         }],
     };
 
-    unsafe {
-        LookupPrivilegeValueW(
-            None,
-            *privilege_to_enable,
-            addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
-        )
-        .ok()?;
-    }
+    LookupPrivilegeValueW(
+        None,
+        privilege_to_disable,
+        addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
+    )
+    .ok()?;
 
-    unsafe {
-        AdjustTokenPrivileges(
-            *handle.get(),
-            false,
-            Some(addr_of!(privilege_wrapper)),
-            0,
-            None,
-            None,
-        )
+    AdjustTokenPrivileges(*handle.get(), false, Some(addr_of!(privilege_wrapper)), 0, None, None)
         .ok()?;
-    }
 
-    // TODO; Check WinLastError again!
+    // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
+    // status of the _request_ but not if all privileges are set. That's why a second test is needed!
+    if Error::from_win32().code() == ERROR_NOT_ALL_ASSIGNED.to_hresult() {
+        // NOTE; No need to reset privileges to consistent state because we update permission 1 by 1.
+        let privilege_string =
+            privilege_to_disable.to_string().unwrap_or_else(|_| "[Decode error]".into());
+        Err(PrivilegeError::PrivilegeNotDisabled(privilege_string))?;
+    }
 
     Ok(())
 }
@@ -344,6 +358,12 @@ pub trait TokenClass {
 impl TokenClass for TOKEN_GROUPS {
     fn class() -> TOKEN_INFORMATION_CLASS {
         TokenGroups
+    }
+}
+
+impl TokenClass for TOKEN_USER {
+    fn class() -> TOKEN_INFORMATION_CLASS {
+        TokenUser
     }
 }
 
