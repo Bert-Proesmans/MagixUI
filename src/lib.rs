@@ -4,7 +4,7 @@ compile_error!("This project only works on Windows systems!");
 use std::{
     ffi::{OsStr, OsString},
     marker::PhantomData,
-    mem::{self, size_of},
+    mem::{self, size_of_val},
     os::windows::prelude::OsStrExt,
     ptr::{addr_of, addr_of_mut},
     slice::from_raw_parts,
@@ -12,21 +12,30 @@ use std::{
 
 use thiserror::Error;
 use windows::{
-    core::{Error, PCWSTR},
+    core::{Error, PCWSTR, PWSTR},
+    w,
     Win32::{
         Foundation::{
             CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
-            ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_TOKEN, HANDLE, LUID, WIN32_ERROR,
+            ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_MORE_FILES, ERROR_NO_TOKEN, HANDLE, PSID,
+            WIN32_ERROR,
         },
         Security::{
-            AdjustTokenPrivileges, GetTokenInformation, ImpersonateSelf, LookupPrivilegeValueW,
-            RevertToSelf, TokenGroups, TokenUser, LUID_AND_ATTRIBUTES,
-            SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
-            TOKEN_ACCESS_MASK, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_USER,
+            AdjustTokenPrivileges, EqualSid, GetTokenInformation, ImpersonateSelf,
+            LookupAccountNameW, LookupPrivilegeValueW, RevertToSelf, TokenGroups, TokenUser,
+            LUID_AND_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED,
+            SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_ACCESS_MASK, TOKEN_GROUPS,
+            TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_USER,
         },
-        System::Threading::{
-            GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-            PROCESS_ACCESS_RIGHTS,
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+                OpenThreadToken, PROCESS_ACCESS_RIGHTS,
+            },
         },
     },
 };
@@ -56,6 +65,7 @@ fn should_quote_string(string: &OsStr) -> bool {
     !start_quotation && !end_quotation && has_spaces
 }
 
+// TODO; Recheck invariants
 pub fn reconstruct_command_line(components: &Vec<OsString>) -> Option<Vec<u16>> {
     let _quotation_mark = OsStr::new("\"");
     let _space = OsStr::new(" ");
@@ -400,14 +410,13 @@ impl<Class: TokenClass> TokenInformation<Class> {
         }
 
         let mut info_buffer = Vec::<u8>::with_capacity(required_size as usize);
-        required_size = 0;
         unsafe {
             GetTokenInformation(
                 *handle.get(),
                 Class::class(),
                 Some(info_buffer.as_mut_ptr().cast()),
-                (info_buffer.capacity() * size_of::<u8>()) as _,
-                addr_of_mut!(required_size),
+                required_size,
+                &mut 0,
             )
             .ok()?;
         }
@@ -426,20 +435,138 @@ impl<Class> AsRef<Class> for TokenInformation<Class> {
 }
 
 // SAFETY; Cannot provide this interface without breaking other safe interfaces
-// impl<Token> AsMut<Token> for TokenInformation<Token> {
-//     fn as_mut(&mut self) -> &mut Token {
-//         // SAFETY; Safe because object construction is bound to generic argument and the buffer is
-//         // completely abstracted behind a type interface.
-//         let info: &mut [Token] =
-//             unsafe { from_raw_parts_mut(self.info_buffer.as_mut_ptr().cast(), 1) };
-//         &mut info[0]
-//     }
-// }
+// impl<Token> AsMut<Token> for TokenInformation<Token> {}
 
 impl TokenInformation<TOKEN_GROUPS> {
     pub fn get_groups(&self) -> &[SID_AND_ATTRIBUTES] {
         let object = self.as_ref();
         // SAFETY; Safe because Groups is a valid aligned pointer, and GroupCount came from the OS.
         unsafe { from_raw_parts(object.Groups.as_ptr(), object.GroupCount as _) }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SIDError {
+    #[error(transparent)]
+    Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
+}
+
+pub struct WrappedSID {
+    info_buffer: Vec<u8>,
+}
+
+impl WrappedSID {
+    pub unsafe fn new_from_local_account(user_name: &OsStr) -> Result<Self, SIDError> {
+        let user_name_buffer: Vec<_> = user_name.encode_wide().chain(Some(0)).collect();
+        let mut sid_required_size = 0;
+        let mut host_required_size = 0;
+        let mut sid_usage = SID_NAME_USE::default();
+
+        unsafe {
+            match LookupAccountNameW(
+                w!("."),
+                PCWSTR::from_raw(user_name_buffer.as_ptr()),
+                PSID::default(),
+                addr_of_mut!(sid_required_size),
+                PWSTR::null(),
+                addr_of_mut!(host_required_size),
+                addr_of_mut!(sid_usage),
+            )
+            .ok()
+            {
+                Ok(_) => unreachable!("This API call is setup to fail!"),
+                Err(error) => match WIN32_ERROR::from_error(&error) {
+                    Some(ERROR_INSUFFICIENT_BUFFER) => { /* Expected error */ }
+                    _ => return Err(SIDError::Other(error)),
+                },
+            };
+        }
+
+        let mut sid_info_buffer = Vec::<u8>::with_capacity(sid_required_size as usize);
+        let mut host_info_buffer = Vec::<u16>::with_capacity(
+            host_required_size as usize / (mem::size_of::<u16>() / mem::size_of::<u8>()),
+        );
+        unsafe {
+            LookupAccountNameW(
+                w!("."),
+                PCWSTR::from_raw(user_name_buffer.as_ptr()),
+                PSID(sid_info_buffer.as_mut_ptr().cast()),
+                addr_of_mut!(sid_required_size),
+                PWSTR::from_raw(host_info_buffer.as_mut_ptr()),
+                addr_of_mut!(host_required_size),
+                addr_of_mut!(sid_usage),
+            )
+            .ok()?;
+        }
+
+        sid_info_buffer.set_len(sid_info_buffer.capacity());
+        Ok(Self { info_buffer: sid_info_buffer })
+    }
+}
+
+impl PartialEq for WrappedSID {
+    fn eq(&self, other: &Self) -> bool {
+        self.info_buffer == other.info_buffer
+    }
+}
+
+impl PartialEq<PSID> for WrappedSID {
+    fn eq(&self, other: &PSID) -> bool {
+        let self_sid = PSID(self.info_buffer.as_ptr().cast_mut().cast());
+        unsafe { EqualSid(self_sid, *other).into() }
+    }
+}
+
+impl AsRef<[u8]> for WrappedSID {
+    fn as_ref(&self) -> &[u8] {
+        &self.info_buffer
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum ProcessSnapshotError {
+    #[error(transparent)]
+    Other(#[from] ::windows::core::Error), // source and Display delegate to ::windows::core::Error
+}
+
+pub struct ProcessSnapshot {
+    snapshot_handle: WrappedHandle,
+    passed_first: bool,
+}
+
+impl ProcessSnapshot {
+    pub fn new() -> Result<Self, ProcessSnapshotError> {
+        let snapshot_handle =
+            unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
+        Ok(Self { snapshot_handle, passed_first: false })
+    }
+}
+
+impl Iterator for ProcessSnapshot {
+    type Item = Result<PROCESSENTRY32W, ProcessSnapshotError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut current_entry = PROCESSENTRY32W::default();
+        current_entry.dwSize =
+            size_of_val(&current_entry).try_into().expect("Integer overflow at PROCESSENTRY32W");
+
+        let internal_operation = match mem::replace(&mut self.passed_first, true) {
+            false => unsafe {
+                Process32FirstW(*self.snapshot_handle.get(), addr_of_mut!(current_entry))
+            },
+            true => unsafe {
+                Process32NextW(*self.snapshot_handle.get(), addr_of_mut!(current_entry))
+            },
+        };
+
+        match internal_operation.ok() {
+            Ok(_) => { /* No issue */ }
+            Err(internal_error) => match WIN32_ERROR::from_error(&internal_error) {
+                Some(ERROR_NO_MORE_FILES) => return None,
+                _ => return Some(Err(internal_error.into())),
+            },
+        };
+
+        Some(Ok(current_entry))
     }
 }

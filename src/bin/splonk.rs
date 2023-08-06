@@ -1,19 +1,22 @@
 use std::ffi::OsString;
 use std::mem::{self, size_of, size_of_val};
+use std::os::windows::prelude::OsStrExt;
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
 use color_eyre::eyre::{eyre, Context, Result};
 use magixui::{
-    enable_privilege, ProcessFlowInstruction, TokenInformation, WrappedHandle, WrappedImpersonation,
+    enable_privilege, Process, ProcessFlowInstruction, ProcessSnapshot, ProcessToken, SIDError,
+    TokenInformation, WrappedHandle, WrappedImpersonation, WrappedSID,
 };
 use thiserror::Error;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, PSID, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    SecurityImpersonation, SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_USER,
+    EqualSid, LookupAccountNameW, SecurityImpersonation, SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY,
+    TOKEN_QUERY_SOURCE, TOKEN_USER,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -63,13 +66,13 @@ ARGS:
 }
 
 enum OperationMode {
-    User { user_name: OsString },
+    User { user_sid: WrappedSID },
     Process { process_name: OsString },
 }
 
 enum OperationModeBuilder {
     None,
-    UserBuilder { user_name: Option<OsString> },
+    UserBuilder { user_sid: Option<WrappedSID> },
     ProcessBuilder { process_name: Option<OsString> },
 }
 
@@ -86,6 +89,9 @@ enum OperationModeBuilderError {
 
     #[error("The argument {0:?} was unexpected in this position, for the given command")]
     ArgumentUnexpected(OsString),
+
+    #[error("No user could be resolved for the username value {0:?}")]
+    UnknownUsername(OsString, #[source] ::windows::core::Error),
 }
 
 impl OperationModeBuilder {
@@ -95,7 +101,7 @@ impl OperationModeBuilder {
 
     pub fn can_consume(&self) -> bool {
         match self {
-            Self::UserBuilder { user_name } if user_name.is_some() => false,
+            Self::UserBuilder { user_sid: user_name } if user_name.is_some() => false,
             Self::ProcessBuilder { process_name } if process_name.is_some() => false,
             _ => true,
         }
@@ -104,9 +110,9 @@ impl OperationModeBuilder {
     pub fn build(self) -> Result<OperationMode, OperationModeBuilderError> {
         match self {
             OperationModeBuilder::None => Err(OperationModeBuilderError::NoCommand),
-            OperationModeBuilder::UserBuilder { user_name } => {
+            OperationModeBuilder::UserBuilder { user_sid: user_name } => {
                 if let Some(user_name) = user_name {
-                    Ok(OperationMode::User { user_name })
+                    Ok(OperationMode::User { user_sid: user_name })
                 } else {
                     Err(OperationModeBuilderError::IncompleteCommand(
                         String::from("user"),
@@ -140,7 +146,7 @@ impl OperationModeBuilder {
             match argument.to_string_lossy() {
                 std::borrow::Cow::Borrowed(str) => match str {
                     "user" => {
-                        let _ = mem::replace(self, Self::UserBuilder { user_name: None });
+                        let _ = mem::replace(self, Self::UserBuilder { user_sid: None });
                         Ok(())
                     }
                     "process" => {
@@ -159,10 +165,18 @@ impl OperationModeBuilder {
     }
 
     fn push_userbuilder(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
-        let Self::UserBuilder { user_name } = self else { unreachable!("Developer OOPSIE") };
-        match (&user_name,) {
+        let Self::UserBuilder { user_sid } = self else { unreachable!("Developer OOPSIE") };
+        match (&user_sid,) {
             (None, ..) => {
-                let _ = mem::replace(user_name, Some(argument));
+                let resolved_user_sid = unsafe {
+                    WrappedSID::new_from_local_account(&argument).map_err(move |err| match err {
+                        SIDError::Other(win32_error) => {
+                            OperationModeBuilderError::UnknownUsername(argument, win32_error)
+                        }
+                    })?
+                };
+
+                let _ = mem::replace(user_sid, Some(resolved_user_sid));
                 Ok(())
             }
             (Some(_), ..) => Err(OperationModeBuilderError::ArgumentUnexpected(argument))?,
@@ -186,9 +200,11 @@ fn main() -> Result<()> {
     match parse_args().wrap_err("During command line arguments parsing")? {
         ProcessFlowInstruction::Terminate => return Ok(()),
         ProcessFlowInstruction::Continue(mut arguments) => {
-            match target_session_snapshot(&mut arguments).wrap_err("During logon session select")? {
+            match build_target_access_token(&mut arguments)
+                .wrap_err("During logon session select")?
+            {
                 ProcessFlowInstruction::Terminate => return Ok(()),
-                ProcessFlowInstruction::Continue(_) => {
+                ProcessFlowInstruction::Continue(access_token) => {
                     match launch_process(arguments).wrap_err("During child process setup")? {
                         _ => Ok(()),
                     }
@@ -242,7 +258,9 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
     }))
 }
 
-fn target_session_snapshot(args: &mut Arguments) -> Result<ProcessFlowInstruction<()>> {
+fn build_target_access_token(
+    args: &mut Arguments,
+) -> Result<ProcessFlowInstruction<WrappedHandle<ProcessToken>>> {
     let impersonation = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
 
     let current_thread = WrappedHandle::new_from_current_thread()?;
@@ -252,80 +270,60 @@ fn target_session_snapshot(args: &mut Arguments) -> Result<ProcessFlowInstructio
         enable_privilege(&thread_token, SE_DEBUG_NAME)?;
     }
 
-    let snapshot_processes =
-        unsafe { WrappedHandle::new(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?) };
+    let mut target_token = None;
+    let process_snapshot = ProcessSnapshot::new()?;
+    for process in process_snapshot {
+        let process = process?;
 
-    let mut current = PROCESSENTRY32W::default();
-    current.dwSize = size_of_val(&current).try_into().expect("Integer overflow at PROCESSENTRY32W");
-    unsafe { Process32FirstW(*snapshot_processes.get(), addr_of_mut!(current)).ok()? };
+        let process_handle = match get_process_handle(process.th32ProcessID) {
+            None => continue,
+            Some(handle) => handle,
+        };
 
-    let mut first = true;
-    loop {
-        // NOTE; Workaround for lack of do-while in Rust syntax.
-        if mem::replace(&mut first, false) == false
-            && match unsafe {
-                Process32NextW(*snapshot_processes.get(), addr_of_mut!(current)).ok()
-            } {
-                Ok(_) => {
-                    /* Move into next iteration */
-                    false
-                }
-                Err(error) => match WIN32_ERROR::from_error(&error) {
-                    Some(ERROR_NO_MORE_FILES) => true,
-                    _ => Err(error)?,
-                },
-            }
-        {
+        let process_token = match get_process_token(&process_handle) {
+            None => continue,
+            Some(token) => token,
+        };
+
+        let user_info = TokenInformation::<TOKEN_USER>::new(&process_token)?;
+
+        let process_match = match args.mode {
+            OperationMode::User { ref user_sid } => *user_sid == user_info.as_ref().User.Sid,
+            OperationMode::Process { ref process_name } => todo!(),
+        };
+
+        if process_match {
+            target_token = Some(process_token);
             break;
         }
-
-        let Ok(target_process) = WrappedHandle::new_from_external_process(
-            current.th32ProcessID,
-            PROCESS_QUERY_INFORMATION.0,
-        )
-        .or_else(|_| {
-            WrappedHandle::new_from_external_process(
-                current.th32ProcessID,
-                PROCESS_QUERY_LIMITED_INFORMATION.0,
-            )
-        }) else {
-            continue;
-        };
-
-        let desired_process_token_access =
-            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
-        let Ok(target_process_token) =
-            target_process.new_token(desired_process_token_access.0).or_else(|_| {
-                target_process.new_token((desired_process_token_access & !TOKEN_QUERY_SOURCE).0)
-            })
-        else {
-            continue;
-        };
-
-        dbg!(current.th32ProcessID);
-        dbg!(current.th32ParentProcessID);
-        {
-            // DEBUG
-            let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&target_process_token)?;
-            for group in groups_info.get_groups() {
-                let sid_string = unsafe {
-                    let mut wide_string = PWSTR::null();
-                    ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
-                    String::from_utf16_lossy(wide_string.as_wide())
-                };
-                println!("{sid_string}");
-            }
-        }
-
-        let user_info = TokenInformation::<TOKEN_USER>::new(&target_process_token)?;
-        let user_sid = user_info.as_ref().User.Sid;
-        // EqualSID
-
-        return Ok(ProcessFlowInstruction::Continue(()));
     }
 
     impersonation.revert()?;
-    Err(eyre!("Not found"))
+    match target_token {
+        Some(token) => Ok(ProcessFlowInstruction::Continue(token)),
+        None => Ok(ProcessFlowInstruction::Terminate),
+    }
+}
+
+fn get_process_handle(process_id: u32) -> Option<WrappedHandle<Process>> {
+    WrappedHandle::new_from_external_process(process_id, PROCESS_QUERY_INFORMATION.0)
+        .or_else(|_| {
+            WrappedHandle::new_from_external_process(
+                process_id,
+                PROCESS_QUERY_LIMITED_INFORMATION.0,
+            )
+        })
+        .ok()
+}
+
+fn get_process_token(
+    process_handle: &WrappedHandle<Process>,
+) -> Option<WrappedHandle<ProcessToken>> {
+    let desired_access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+    process_handle
+        .new_token(desired_access.0)
+        .or_else(|_| process_handle.new_token((desired_access & !TOKEN_QUERY_SOURCE).0))
+        .ok()
 }
 
 fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
