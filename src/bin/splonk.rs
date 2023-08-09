@@ -1,20 +1,22 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::mem::{self, size_of, size_of_val};
-use std::os::windows::prelude::OsStrExt;
+use std::os::windows::prelude::{OsStrExt, OsStringExt};
+use std::path::Path;
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
 
 use color_eyre::eyre::{eyre, Context, Result};
 use magixui::{
-    enable_privilege, Process, ProcessFlowInstruction, ProcessSnapshot, ProcessToken, SIDError,
-    TokenInformation, WrappedHandle, WrappedImpersonation, WrappedSID,
+    contains_wide, enable_privilege, Process, ProcessFlowInstruction, ProcessSnapshot,
+    ProcessToken, SIDError, TokenInformation, WrappedHandle, WrappedImpersonation, WrappedSID,
 };
 use thiserror::Error;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, PSID, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, PSID, WIN32_ERROR};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    EqualSid, LookupAccountNameW, SecurityImpersonation, SE_DEBUG_NAME, TOKEN_ADJUST_PRIVILEGES,
+    DuplicateTokenEx, EqualSid, LookupAccountNameW, SecurityImpersonation, TokenPrimary,
+    SECURITY_ATTRIBUTES, SE_DEBUG_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY,
     TOKEN_QUERY_SOURCE, TOKEN_USER,
 };
@@ -25,6 +27,7 @@ use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSFreeMemory, WTSGetActiveConsoleSessionId,
 };
+use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::{
     PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -41,13 +44,13 @@ Magix Tada
 Launch a child process into a different user logon session->window station->desktop than the parent process is currently using.
 
 USAGE:
-    {bin_name} [SWITCHES] [FLAGS] [| [user UserName] [process ProcessName] ] -- ProcessPath ProcessArgument1 ProcessArgument2 ProcessArgumentN
+    {bin_name} [SWITCHES] [OPTIONS] [| [user UserName] [process ProcessName] ] -- ProcessPath ProcessArgument1 ProcessArgument2 ProcessArgumentN
 
 SWITCHES:
     --help                          Prints help information and exits
     -w, --wait                      Wait for the child process to exit before continuing
 
-FLAGS:
+OPTIONS:
     -w, --wait=milliseconds         Wait for the child process to exit before continuing, but no longer than the provided amount of milliseconds
     -p, --process=processName       The target session must have a process running which image-name property equals the provided processName
 
@@ -190,6 +193,7 @@ impl OperationModeBuilder {
 
 struct Arguments {
     wait_for_child: Option<u32>,
+    process_name_filter: Option<OsString>,
     mode: OperationMode,
     command_line: Vec<OsString>,
 }
@@ -217,8 +221,9 @@ fn main() -> Result<()> {
 fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
     use lexopt::prelude::*;
     let mut wait_for_child = None;
-    let mut command_line = Vec::new();
+    let mut process_name_filter = None;
     let mut operation_builder = OperationModeBuilder::new();
+    let mut command_line = Vec::new();
 
     let mut parser = lexopt::Parser::from_env();
     while let Some(arg) = parser.next()? {
@@ -233,6 +238,13 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
                     Some(millis) => Some(millis.parse()?),
                     None => Some(INFINITE),
                 };
+            }
+            Short('p') | Long("process") => {
+                process_name_filter = Some(
+                    parser
+                        .optional_value()
+                        .ok_or(eyre!("No value provided for option 'process'!"))?,
+                );
             }
             Value(argument) if operation_builder.can_consume() => {
                 if let Err(error) = operation_builder.push(argument) {
@@ -253,6 +265,7 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
 
     Ok(ProcessFlowInstruction::Continue(Arguments {
         wait_for_child,
+        process_name_filter,
         command_line,
         mode: operation_builder.build()?,
     }))
@@ -292,10 +305,29 @@ fn build_target_access_token(
             OperationMode::Process { ref process_name } => todo!(),
         };
 
-        if process_match {
-            target_token = Some(process_token);
-            break;
+        if !process_match {
+            continue;
         }
+
+        if let Some(process_name_filter) = args.process_name_filter.as_ref() {
+            let needle: Vec<_> = process_name_filter.encode_wide().collect();
+            let haystack = OsString::from_wide(&process.szExeFile);
+            let haystack = Path::new(&haystack);
+            let needle_found = haystack
+                .file_stem()
+                .map(|stem| stem.encode_wide().collect::<Vec<_>>())
+                .map(|haystack| contains_wide(&haystack, &needle));
+
+            match needle_found {
+                None | Some(false) => {
+                    continue;
+                }
+                Some(true) => { /* Do nothing */ }
+            }
+        }
+
+        target_token = Some(process_token.duplicate_impersonation()?);
+        break;
     }
 
     impersonation.revert()?;

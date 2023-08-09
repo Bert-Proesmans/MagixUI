@@ -6,7 +6,7 @@ use std::{
 };
 
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use magixui::{reconstruct_command_line, ProcessFlowInstruction};
+use magixui::{create_command_line_widestring, ProcessFlowInstruction};
 use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
@@ -295,7 +295,7 @@ fn launch_process(mut args: Arguments) -> Result<ProcessFlowInstruction<()>> {
     // Inheriting is not enabled by default, only activated by using the CLI options.
     startup_info.dwFlags &= !STARTF_USESTDHANDLES;
 
-    let mut command_line = match reconstruct_command_line(&args.command_line) {
+    let mut command_line = match create_command_line_widestring(&args.command_line) {
         Some(command_line) => command_line,
         None => {
             return Err(eyre!("No command provided"));

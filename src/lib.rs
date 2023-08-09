@@ -21,9 +21,10 @@ use windows::{
             WIN32_ERROR,
         },
         Security::{
-            AdjustTokenPrivileges, EqualSid, GetTokenInformation, ImpersonateSelf,
-            LookupAccountNameW, LookupPrivilegeValueW, RevertToSelf, TokenGroups, TokenUser,
-            LUID_AND_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED,
+            AdjustTokenPrivileges, DuplicateTokenEx, EqualSid, GetTokenInformation,
+            ImpersonateSelf, LookupAccountNameW, LookupPrivilegeValueW, RevertToSelf,
+            SecurityImpersonation, TokenGroups, TokenPrimary, TokenUser, LUID_AND_ATTRIBUTES,
+            SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED,
             SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_ACCESS_MASK, TOKEN_GROUPS,
             TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_USER,
         },
@@ -32,6 +33,7 @@ use windows::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
+            SystemServices::MAXIMUM_ALLOWED,
             Threading::{
                 GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
                 OpenThreadToken, PROCESS_ACCESS_RIGHTS,
@@ -45,53 +47,79 @@ pub enum ProcessFlowInstruction<PayloadType> {
     Terminate,
 }
 
-#[cfg(windows)]
-fn should_quote_string(string: &OsStr) -> bool {
-    // TODO; These values are probably const-able
-    let _space: Vec<_> = OsStr::new(" ").encode_wide().collect();
-    let _quotation_mark: Vec<_> = OsStr::new("\"").encode_wide().collect();
-
-    let string_bytes: Vec<_> = string.encode_wide().collect();
-    if string_bytes.len() == 0 {
-        return false;
-    }
-
-    let has_spaces =
-        string_bytes[..].windows(_space.len()).position(|window| *window == *_space).is_some();
-    let start_quotation = string_bytes[.._quotation_mark.len()] == *_quotation_mark;
-    let end_quotation =
-        string_bytes[(string_bytes.len() - _quotation_mark.len())..] == *_quotation_mark;
-
-    !start_quotation && !end_quotation && has_spaces
+#[inline]
+pub fn contains_wide(haystack: &[u16], needle: &[u16]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-// TODO; Recheck invariants
-pub fn reconstruct_command_line(components: &Vec<OsString>) -> Option<Vec<u16>> {
-    let _quotation_mark = OsStr::new("\"");
-    let _space = OsStr::new(" ");
-    let expected_length: usize = components.iter().map(|component| component.len() + 2).sum();
+#[inline]
+pub fn find_last_quote_occurence(haystack: &OsStr) -> Option<(usize, bool)> {
+    let haystack: Vec<_> = haystack.encode_wide().collect();
+    let needle: Vec<_> = "\"".encode_utf16().collect();
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle.as_slice())
+        .map(|position| (position, haystack.len() == position + needle.len()))
+}
 
-    let reconstructed: Vec<_> = components
-        .iter()
-        .fold(OsString::with_capacity(expected_length), |mut collector, component| {
-            if should_quote_string(&component) {
-                collector.extend([_quotation_mark, component.as_os_str(), _quotation_mark, _space]);
-            } else {
-                collector.extend([component.as_os_str(), _space]);
-            }
+#[inline]
+pub fn find_first_quote_occurence(haystack: &OsStr) -> Option<(usize, bool)> {
+    let haystack: Vec<_> = haystack.encode_wide().collect();
+    let needle: Vec<_> = "\"".encode_utf16().collect();
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+        .map(|position| (position, position == 0))
+}
 
-            collector
-        })
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+#[inline]
+pub fn find_last_separator_occurence(haystack: &OsStr) -> Option<(usize, bool)> {
+    let haystack: Vec<_> = haystack.encode_wide().collect();
+    let needle: Vec<_> = "\\".encode_utf16().collect();
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle.as_slice())
+        .map(|position| (position, haystack.len() == position + needle.len()))
+}
 
-    // NOTE; Nothing is returned when the parts make no syntactically correct
-    // commandline.
-    if reconstructed.len() > 1 {
-        Some(reconstructed)
-    } else {
-        None
+#[inline]
+pub fn find_first_separator_occurence(haystack: &OsStr) -> Option<(usize, bool)> {
+    let haystack: Vec<_> = haystack.encode_wide().collect();
+    let needle: Vec<_> = "\\".encode_utf16().collect();
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())
+        .map(|position| (position, position == 0))
+}
+
+fn should_quote_string(haystack_string: &OsStr) -> bool {
+    let haystack: Vec<_> = haystack_string.encode_wide().collect();
+
+    let space_needle: Vec<_> = " ".encode_utf16().collect();
+    let has_space = contains_wide(&haystack, &space_needle);
+    let starts_with_quote = matches!(find_first_quote_occurence(haystack_string), Some((_, true)));
+    let ends_with_quote = matches!(find_last_quote_occurence(haystack_string), Some((_, true)));
+
+    has_space && (!starts_with_quote || !ends_with_quote)
+}
+
+pub fn create_command_line_widestring(components: &Vec<OsString>) -> Option<Vec<u16>> {
+    let quote = OsStr::new("\"");
+    let space = OsStr::new(" ");
+    let constructed = components.iter().fold(OsString::new(), |mut collector, component| {
+        if should_quote_string(&component) {
+            collector.extend([quote, component, quote, space]);
+        } else {
+            collector.extend([component, space]);
+        }
+
+        collector
+    });
+
+    // WARN; Don't return anything if the command line is empty
+    match constructed.len() > 1 {
+        true => Some(constructed.encode_wide().collect()),
+        false => None,
     }
 }
 
@@ -329,7 +357,30 @@ impl WrappedHandle<Process> {
     }
 }
 
-impl WrappedHandle<ProcessToken> {}
+impl WrappedHandle<ProcessToken> {
+    pub fn duplicate_impersonation(&self) -> Result<Self, WrappedHandleError> {
+        let mut security_attributes = SECURITY_ATTRIBUTES::default();
+        security_attributes.nLength = size_of_val(&security_attributes)
+            .try_into()
+            .expect("Integer overflow at SECURITY_ATTRIBUTES");
+        security_attributes.bInheritHandle = false.into();
+
+        let mut duplicated_handle = HANDLE::default();
+        unsafe {
+            DuplicateTokenEx(
+                self.handle,
+                TOKEN_ACCESS_MASK(MAXIMUM_ALLOWED),
+                Some(&security_attributes),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut duplicated_handle,
+            )
+            .ok()?;
+        }
+
+        Ok(Self { handle: duplicated_handle, _phantom: PhantomData })
+    }
+}
 
 impl WrappedHandle<Thread> {
     pub fn new_token(
