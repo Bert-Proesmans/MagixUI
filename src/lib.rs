@@ -3,10 +3,11 @@ compile_error!("This project only works on Windows systems!");
 
 use std::{
     ffi::{OsStr, OsString},
+    fmt::Debug,
     marker::PhantomData,
     mem::{self, size_of_val},
-    os::windows::prelude::OsStrExt,
-    ptr::{addr_of, addr_of_mut},
+    os::windows::prelude::{OsStrExt, OsStringExt},
+    path::PathBuf,
     slice::from_raw_parts,
 };
 
@@ -36,7 +37,8 @@ use windows::{
             SystemServices::MAXIMUM_ALLOWED,
             Threading::{
                 GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
-                OpenThreadToken, PROCESS_ACCESS_RIGHTS,
+                OpenThreadToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
+                PROCESS_NAME_WIN32,
             },
         },
     },
@@ -209,22 +211,16 @@ pub unsafe fn enable_privilege(
         }],
     };
 
-    LookupPrivilegeValueW(
-        None,
-        privilege_to_enable,
-        addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
-    )
-    .ok()
-    .map_err(|_| {
-        let privilege_string =
-            privilege_to_enable.to_string().unwrap_or_else(|_| "[Decode error]".into());
-        PrivilegeError::InvalidPrivilegeName(privilege_string)
-    })?;
+    LookupPrivilegeValueW(None, privilege_to_enable, &mut privilege_wrapper.Privileges[0].Luid)
+        .ok()
+        .map_err(|_| {
+            let privilege_string =
+                privilege_to_enable.to_string().unwrap_or_else(|_| "[Decode error]".into());
+            PrivilegeError::InvalidPrivilegeName(privilege_string)
+        })?;
 
-    unsafe {
-        AdjustTokenPrivileges(*token.get(), false, Some(addr_of!(privilege_wrapper)), 0, None, None)
-    }
-    .ok()?;
+    unsafe { AdjustTokenPrivileges(*token.get(), false, Some(&privilege_wrapper), 0, None, None) }
+        .ok()?;
 
     // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
     // status of the _request_ but not if all privileges are set. That's why a second test is needed!
@@ -252,15 +248,10 @@ pub unsafe fn disable_privilege(
         }],
     };
 
-    LookupPrivilegeValueW(
-        None,
-        privilege_to_disable,
-        addr_of_mut!(privilege_wrapper.Privileges[0].Luid),
-    )
-    .ok()?;
-
-    AdjustTokenPrivileges(*handle.get(), false, Some(addr_of!(privilege_wrapper)), 0, None, None)
+    LookupPrivilegeValueW(None, privilege_to_disable, &mut privilege_wrapper.Privileges[0].Luid)
         .ok()?;
+
+    AdjustTokenPrivileges(*handle.get(), false, Some(&privilege_wrapper), 0, None, None).ok()?;
 
     // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
     // status of the _request_ but not if all privileges are set. That's why a second test is needed!
@@ -291,6 +282,12 @@ pub struct ThreadToken;
 pub struct WrappedHandle<Token = ()> {
     handle: HANDLE,
     _phantom: PhantomData<Token>,
+}
+
+impl<Token> Debug for WrappedHandle<Token> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrappedHandle").field("handle", &self.handle).finish()
+    }
 }
 
 impl WrappedHandle {
@@ -337,12 +334,9 @@ impl WrappedHandle<Process> {
     ) -> Result<WrappedHandle<ProcessToken>, WrappedHandleError> {
         let mut handle: HANDLE = Default::default();
         unsafe {
-            if let Err(error) = OpenProcessToken(
-                self.handle,
-                TOKEN_ACCESS_MASK(token_access_rights),
-                addr_of_mut!(handle),
-            )
-            .ok()
+            if let Err(error) =
+                OpenProcessToken(self.handle, TOKEN_ACCESS_MASK(token_access_rights), &mut handle)
+                    .ok()
             {
                 match WIN32_ERROR::from_error(&error) {
                     Some(ERROR_NO_TOKEN) | Some(ERROR_NO_IMPERSONATION_TOKEN) => {
@@ -354,6 +348,43 @@ impl WrappedHandle<Process> {
         };
 
         Ok(WrappedHandle { handle, _phantom: PhantomData })
+    }
+
+    pub fn get_process_image_path(&self) -> Result<PathBuf, WrappedHandleError> {
+        let mut available_codepoints: u32 =
+            (1 << 7).try_into().expect("Integer overflow at QueryFullProcessImageName");
+        let mut buffer = Vec::<u16>::with_capacity(available_codepoints as usize);
+
+        loop {
+            unsafe {
+                match QueryFullProcessImageNameW(
+                    self.handle,
+                    PROCESS_NAME_WIN32,
+                    PWSTR::from_raw(buffer.as_mut_ptr()),
+                    &mut available_codepoints,
+                )
+                .ok()
+                {
+                    Ok(_) => break,
+                    Err(error) => match WIN32_ERROR::from_error(&error) {
+                        Some(ERROR_INSUFFICIENT_BUFFER) => { /* Expected error */ }
+                        _ => return Err(WrappedHandleError::Other(error)),
+                    },
+                };
+            }
+
+            // Retry with a bigger buffer
+            available_codepoints = available_codepoints
+                .checked_shl(1)
+                .expect("Integer overflow at QueryFullProcessImageName");
+            // WARN; The len value is never updated, so reserve will function as if available_codepoints
+            // is an absolute value.
+            buffer.reserve(available_codepoints as usize);
+        }
+
+        let wide_string = PWSTR::from_raw(buffer.as_mut_ptr());
+        let wide_string = OsString::from_wide(unsafe { wide_string.as_wide() });
+        Ok(PathBuf::from(wide_string))
     }
 }
 
@@ -394,7 +425,7 @@ impl WrappedHandle<Thread> {
                 self.handle,
                 TOKEN_ACCESS_MASK(token_access_rights),
                 !open_with_impersonation,
-                addr_of_mut!(handle),
+                &mut handle,
             )
             .ok()?
         };
@@ -443,14 +474,8 @@ impl<Class: TokenClass> TokenInformation<Class> {
     pub fn new(handle: &WrappedHandle<ProcessToken>) -> Result<Self, TokenInformationError> {
         let mut required_size = 0;
         unsafe {
-            match GetTokenInformation(
-                *handle.get(),
-                Class::class(),
-                None,
-                0,
-                addr_of_mut!(required_size),
-            )
-            .ok()
+            match GetTokenInformation(*handle.get(), Class::class(), None, 0, &mut required_size)
+                .ok()
             {
                 Ok(_) => unreachable!("This API call is setup to fail!"),
                 Err(error) => match WIN32_ERROR::from_error(&error) {
@@ -518,10 +543,10 @@ impl WrappedSID {
                 w!("."),
                 PCWSTR::from_raw(user_name_buffer.as_ptr()),
                 PSID::default(),
-                addr_of_mut!(sid_required_size),
+                &mut sid_required_size,
                 PWSTR::null(),
-                addr_of_mut!(host_required_size),
-                addr_of_mut!(sid_usage),
+                &mut host_required_size,
+                &mut sid_usage,
             )
             .ok()
             {
@@ -542,10 +567,10 @@ impl WrappedSID {
                 w!("."),
                 PCWSTR::from_raw(user_name_buffer.as_ptr()),
                 PSID(sid_info_buffer.as_mut_ptr().cast()),
-                addr_of_mut!(sid_required_size),
+                &mut sid_required_size,
                 PWSTR::from_raw(host_info_buffer.as_mut_ptr()),
-                addr_of_mut!(host_required_size),
-                addr_of_mut!(sid_usage),
+                &mut host_required_size,
+                &mut sid_usage,
             )
             .ok()?;
         }
@@ -602,12 +627,8 @@ impl Iterator for ProcessSnapshot {
             size_of_val(&current_entry).try_into().expect("Integer overflow at PROCESSENTRY32W");
 
         let internal_operation = match mem::replace(&mut self.passed_first, true) {
-            false => unsafe {
-                Process32FirstW(*self.snapshot_handle.get(), addr_of_mut!(current_entry))
-            },
-            true => unsafe {
-                Process32NextW(*self.snapshot_handle.get(), addr_of_mut!(current_entry))
-            },
+            false => unsafe { Process32FirstW(*self.snapshot_handle.get(), &mut current_entry) },
+            true => unsafe { Process32NextW(*self.snapshot_handle.get(), &mut current_entry) },
         };
 
         match internal_operation.ok() {

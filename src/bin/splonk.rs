@@ -29,7 +29,7 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::{
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::{
     RemoteDesktop::{WTSEnumerateSessionsW, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW},
@@ -180,14 +180,21 @@ impl OperationModeBuilder {
                 };
 
                 let _ = mem::replace(user_sid, Some(resolved_user_sid));
-                Ok(())
             }
             (Some(_), ..) => Err(OperationModeBuilderError::ArgumentUnexpected(argument))?,
-        }
+        };
+
+        Ok(())
     }
 
     fn push_processbuilder(&mut self, argument: OsString) -> Result<(), OperationModeBuilderError> {
-        todo!()
+        let Self::ProcessBuilder { process_name } = self else { unreachable!("Developer OOPSIE") };
+        match (&process_name,) {
+            (None, ..) => mem::replace(process_name, Some(argument)),
+            (Some(_), ..) => Err(OperationModeBuilderError::ArgumentUnexpected(argument))?,
+        };
+
+        Ok(())
     }
 }
 
@@ -209,7 +216,9 @@ fn main() -> Result<()> {
             {
                 ProcessFlowInstruction::Terminate => return Ok(()),
                 ProcessFlowInstruction::Continue(access_token) => {
-                    match launch_process(arguments).wrap_err("During child process setup")? {
+                    match launch_process(arguments, access_token)
+                        .wrap_err("During child process setup")?
+                    {
                         _ => Ok(()),
                     }
                 }
@@ -271,6 +280,35 @@ fn parse_args() -> Result<ProcessFlowInstruction<Arguments>> {
     }))
 }
 
+fn get_process_handle(process_id: u32) -> Option<WrappedHandle<Process>> {
+    WrappedHandle::new_from_external_process(process_id, PROCESS_QUERY_INFORMATION.0)
+        .or_else(|_| {
+            WrappedHandle::new_from_external_process(
+                process_id,
+                PROCESS_QUERY_LIMITED_INFORMATION.0,
+            )
+        })
+        .ok()
+}
+
+fn get_process_token(
+    process_handle: &WrappedHandle<Process>,
+) -> Option<WrappedHandle<ProcessToken>> {
+    let desired_access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+    process_handle
+        .new_token(desired_access.0)
+        .or_else(|_| process_handle.new_token((desired_access & !TOKEN_QUERY_SOURCE).0))
+        .ok()
+}
+
+fn match_process_basename(path: &Path, needle: &OsString) -> bool {
+    let needle: Vec<_> = needle.encode_wide().collect();
+    path.file_stem()
+        .map(|stem| stem.encode_wide().collect::<Vec<_>>())
+        .map(|haystack| contains_wide(&haystack, &needle))
+        .is_some_and(|result| result == true)
+}
+
 fn build_target_access_token(
     args: &mut Arguments,
 ) -> Result<ProcessFlowInstruction<WrappedHandle<ProcessToken>>> {
@@ -302,7 +340,10 @@ fn build_target_access_token(
 
         let process_match = match args.mode {
             OperationMode::User { ref user_sid } => *user_sid == user_info.as_ref().User.Sid,
-            OperationMode::Process { ref process_name } => todo!(),
+            OperationMode::Process { ref process_name } => {
+                let process_path = process_handle.get_process_image_path()?;
+                match_process_basename(&process_path, process_name)
+            }
         };
 
         if !process_match {
@@ -310,19 +351,11 @@ fn build_target_access_token(
         }
 
         if let Some(process_name_filter) = args.process_name_filter.as_ref() {
-            let needle: Vec<_> = process_name_filter.encode_wide().collect();
             let haystack = OsString::from_wide(&process.szExeFile);
             let haystack = Path::new(&haystack);
-            let needle_found = haystack
-                .file_stem()
-                .map(|stem| stem.encode_wide().collect::<Vec<_>>())
-                .map(|haystack| contains_wide(&haystack, &needle));
-
-            match needle_found {
-                None | Some(false) => {
-                    continue;
-                }
-                Some(true) => { /* Do nothing */ }
+            let is_match = match_process_basename(&haystack, process_name_filter);
+            if is_match == false {
+                continue;
             }
         }
 
@@ -335,27 +368,6 @@ fn build_target_access_token(
         Some(token) => Ok(ProcessFlowInstruction::Continue(token)),
         None => Ok(ProcessFlowInstruction::Terminate),
     }
-}
-
-fn get_process_handle(process_id: u32) -> Option<WrappedHandle<Process>> {
-    WrappedHandle::new_from_external_process(process_id, PROCESS_QUERY_INFORMATION.0)
-        .or_else(|_| {
-            WrappedHandle::new_from_external_process(
-                process_id,
-                PROCESS_QUERY_LIMITED_INFORMATION.0,
-            )
-        })
-        .ok()
-}
-
-fn get_process_token(
-    process_handle: &WrappedHandle<Process>,
-) -> Option<WrappedHandle<ProcessToken>> {
-    let desired_access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
-    process_handle
-        .new_token(desired_access.0)
-        .or_else(|_| process_handle.new_token((desired_access & !TOKEN_QUERY_SOURCE).0))
-        .ok()
 }
 
 fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
@@ -457,6 +469,11 @@ fn target_session_wts(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32
     Ok(ProcessFlowInstruction::Continue(active_session_id))
 }
 
-fn launch_process(mut args: Arguments) -> Result<ProcessFlowInstruction<()>> {
+fn launch_process(
+    mut args: Arguments,
+    target_access_token: WrappedHandle<ProcessToken>,
+) -> Result<ProcessFlowInstruction<()>> {
+    println!("Token handle value {:?}", target_access_token);
+
     todo!()
 }
