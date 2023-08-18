@@ -24,10 +24,11 @@ use windows::{
         Security::{
             AdjustTokenPrivileges, DuplicateTokenEx, EqualSid, GetTokenInformation,
             ImpersonateSelf, LookupAccountNameW, LookupPrivilegeValueW, RevertToSelf,
-            SecurityImpersonation, TokenGroups, TokenPrimary, TokenUser, LUID_AND_ATTRIBUTES,
-            SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL, SE_PRIVILEGE_ENABLED,
-            SID_AND_ATTRIBUTES, SID_NAME_USE, TOKEN_ACCESS_MASK, TOKEN_GROUPS,
-            TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_USER,
+            SecurityImpersonation, TokenGroups, TokenPrimary, TokenPrivileges, TokenUser,
+            LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
+            SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_ENABLED_BY_DEFAULT, SID_AND_ATTRIBUTES,
+            SID_NAME_USE, TOKEN_ACCESS_MASK, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+            TOKEN_PRIVILEGES, TOKEN_USER,
         },
         System::{
             Diagnostics::ToolHelp::{
@@ -47,6 +48,12 @@ use windows::{
 pub enum ProcessFlowInstruction<PayloadType> {
     Continue(PayloadType),
     Terminate,
+}
+
+#[inline]
+pub fn bytes_for_whchar_size(character_count: u32) -> usize {
+    const MAX_BYTES_PER_U16_CHAR: u32 = 4;
+    (character_count * MAX_BYTES_PER_U16_CHAR) as usize
 }
 
 #[inline]
@@ -459,6 +466,12 @@ impl TokenClass for TOKEN_USER {
     }
 }
 
+impl TokenClass for TOKEN_PRIVILEGES {
+    fn class() -> TOKEN_INFORMATION_CLASS {
+        TokenPrivileges
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum TokenInformationError {
     #[error(transparent)]
@@ -521,6 +534,30 @@ impl TokenInformation<TOKEN_GROUPS> {
     }
 }
 
+impl TokenInformation<TOKEN_PRIVILEGES> {
+    pub fn has_privilege(&self, privilege: &PCWSTR) -> Result<bool, PrivilegeError> {
+        let mut local_uid = Default::default();
+        unsafe {
+            LookupPrivilegeValueW(None, *privilege, &mut local_uid).ok().map_err(|_| {
+                let privilege_string =
+                    privilege.to_string().unwrap_or_else(|_| "[Decode error]".into());
+                PrivilegeError::InvalidPrivilegeName(privilege_string)
+            })?
+        };
+
+        Ok(self.get_privileges().iter().any(|privilege_data| {
+            privilege_data.Luid == local_uid
+                && [SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_ENABLED_BY_DEFAULT]
+                    .contains(&privilege_data.Attributes)
+        }))
+    }
+
+    pub fn get_privileges(&self) -> &[LUID_AND_ATTRIBUTES] {
+        let object = self.as_ref();
+        unsafe { from_raw_parts(object.Privileges.as_ptr(), object.PrivilegeCount as _) }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum SIDError {
     #[error(transparent)]
@@ -535,7 +572,7 @@ impl WrappedSID {
     pub unsafe fn new_from_local_account(user_name: &OsStr) -> Result<Self, SIDError> {
         let user_name_buffer: Vec<_> = user_name.encode_wide().chain(Some(0)).collect();
         let mut sid_required_size = 0;
-        let mut host_required_size = 0;
+        let mut host_required_characters = 0;
         let mut sid_usage = SID_NAME_USE::default();
 
         unsafe {
@@ -545,7 +582,7 @@ impl WrappedSID {
                 PSID::default(),
                 &mut sid_required_size,
                 PWSTR::null(),
-                &mut host_required_size,
+                &mut host_required_characters,
                 &mut sid_usage,
             )
             .ok()
@@ -559,9 +596,10 @@ impl WrappedSID {
         }
 
         let mut sid_info_buffer = Vec::<u8>::with_capacity(sid_required_size as usize);
-        let mut host_info_buffer = Vec::<u16>::with_capacity(
-            host_required_size as usize / (mem::size_of::<u16>() / mem::size_of::<u8>()),
-        );
+        // NOTE; Convert amount of u8 into amount of u16
+        let mut host_info_buffer =
+            Vec::<u16>::with_capacity((bytes_for_whchar_size(host_required_characters) + 1) / 2);
+
         unsafe {
             LookupAccountNameW(
                 w!("."),
@@ -569,13 +607,13 @@ impl WrappedSID {
                 PSID(sid_info_buffer.as_mut_ptr().cast()),
                 &mut sid_required_size,
                 PWSTR::from_raw(host_info_buffer.as_mut_ptr()),
-                &mut host_required_size,
+                &mut host_required_characters,
                 &mut sid_usage,
             )
             .ok()?;
         }
 
-        sid_info_buffer.set_len(sid_info_buffer.capacity());
+        sid_info_buffer.set_len(sid_required_size as usize);
         Ok(Self { info_buffer: sid_info_buffer })
     }
 }
