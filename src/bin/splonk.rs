@@ -7,29 +7,34 @@ use std::slice::{self, from_raw_parts};
 
 use color_eyre::eyre::{eyre, Context, Result};
 use magixui::{
-    contains_wide, enable_privilege, Process, ProcessFlowInstruction, ProcessSnapshot,
-    ProcessToken, SIDError, TokenInformation, WrappedHandle, WrappedImpersonation, WrappedSID,
+    contains_wide, create_command_line_widestring, enable_privilege, Process,
+    ProcessFlowInstruction, ProcessSnapshot, ProcessToken, SIDError, TokenInformation,
+    WrappedHandle, WrappedImpersonation, WrappedSID,
 };
 use thiserror::Error;
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, PSID, WIN32_ERROR};
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PRIVILEGE_NOT_HELD, WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
+};
 use windows::Win32::Security::{
     DuplicateTokenEx, EqualSid, LookupAccountNameW, SecurityImpersonation, TokenPrimary,
-    SECURITY_ATTRIBUTES, SE_DEBUG_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_QUERY,
-    TOKEN_QUERY_SOURCE, TOKEN_USER,
+    SECURITY_ATTRIBUTES, SE_ASSIGNPRIMARYTOKEN_NAME, SE_DEBUG_NAME, SE_INCREASE_QUOTA_NAME,
+    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_USER,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::Environment::CreateEnvironmentBlock;
 use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSFreeMemory, WTSGetActiveConsoleSessionId,
 };
 use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::{
-    QueryFullProcessImageNameW, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateProcessAsUserW, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 use windows::Win32::System::{
     RemoteDesktop::{WTSEnumerateSessionsW, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW},
@@ -293,11 +298,11 @@ fn get_process_handle(process_id: u32) -> Option<WrappedHandle<Process>> {
 
 fn get_process_token(
     process_handle: &WrappedHandle<Process>,
+    desired_access: u32,
 ) -> Option<WrappedHandle<ProcessToken>> {
-    let desired_access = TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
     process_handle
-        .new_token(desired_access.0)
-        .or_else(|_| process_handle.new_token((desired_access & !TOKEN_QUERY_SOURCE).0))
+        .new_token(desired_access)
+        .or_else(|_| process_handle.new_token(desired_access & !TOKEN_QUERY_SOURCE.0))
         .ok()
 }
 
@@ -331,7 +336,12 @@ fn build_target_access_token(
             Some(handle) => handle,
         };
 
-        let process_token = match get_process_token(&process_handle) {
+        // WARN; Specific mask required for all the operations further down the execution path!
+        // TOKEN_ASSIGN_PRIMARY => Use the token to start a new process
+        // ..
+        let desired_access =
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE | TOKEN_QUERY;
+        let process_token = match get_process_token(&process_handle, desired_access.0) {
             None => continue,
             Some(token) => token,
         };
@@ -370,110 +380,152 @@ fn build_target_access_token(
     }
 }
 
-fn target_session_proc(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
-    let mut process_ids = Vec::<u32>::with_capacity(1024);
-    let available_buffer = (process_ids.capacity() * size_of::<u32>())
-        .try_into()
-        .expect("Integer overflow at EnumProcesses");
-    let mut consumed_buffer = 0;
-
-    unsafe {
-        EnumProcesses(process_ids.as_mut_ptr(), available_buffer, addr_of_mut!(consumed_buffer))
-            .ok()?;
-    }
-
-    if available_buffer == consumed_buffer {
-        return Err(eyre!("Didn't provide enough buffer space to enumerate all processes on this system. This is a programmer's mistake!"));
-    }
-
-    let filled_items = consumed_buffer as usize / size_of::<u32>();
-    let process_ids: &[u32] = unsafe { from_raw_parts(process_ids.as_ptr().cast(), filled_items) };
-
-    println!("Process IDs: {:?}", process_ids.iter().take(10).collect::<Vec<_>>());
-
-    for process in process_ids.into_iter() {
-        println!("Process {}", process);
-        if process == &0 {
-            continue;
-        }
-        // let process_handle = unsafe {
-        //     match OpenProcess(PROCESS_QUERY_INFORMATION, false, *process) {
-        //         Ok(token) => token,
-        //         Err(_) => OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, *process)?,
-        //     }
-        // };
-
-        // let mut process_token = HANDLE::default();
-        // unsafe {
-        //     OpenProcessToken(
-        //         process_handle,
-        //         TOKEN_QUERY
-        //             | TOKEN_READ
-        //             | TOKEN_IMPERSONATE
-        //             | TOKEN_QUERY_SOURCE
-        //             | TOKEN_DUPLICATE
-        //             | TOKEN_ASSIGN_PRIMARY
-        //             | TOKEN_EXECUTE,
-        //         addr_of_mut!(process_token),
-        //     )
-        //     .ok()?
-        // };
-        let process_token = WrappedHandle::new_from_current_process()?;
-
-        // let groups_info = TokenInformation::<TOKEN_GROUPS>::new(&process_token)?;
-        // for group in groups_info.get_groups() {
-        //     let sid_string = unsafe {
-        //         let mut wide_string = PWSTR::null();
-        //         ConvertSidToStringSidW(group.Sid, addr_of_mut!(wide_string)).ok()?;
-        //         String::from_utf16_lossy(wide_string.as_wide())
-        //     };
-        //     println!("{sid_string}");
-        // }
-
-        println!();
-    }
-
-    todo!()
-}
-
-fn target_session_wts(args: &mut Arguments) -> Result<ProcessFlowInstruction<u32>> {
-    let user_sessions: &[WTS_SESSION_INFOW];
-    let mut sessions_ptr: *mut WTS_SESSION_INFOW = ptr::null_mut();
-    unsafe {
-        let mut session_count: u32 = 0;
-        WTSEnumerateSessionsW(
-            WTS_CURRENT_SERVER_HANDLE,
-            0,
-            1,
-            addr_of_mut!(sessions_ptr),
-            addr_of_mut!(session_count),
-        )
-        .ok()?;
-        user_sessions = slice::from_raw_parts(sessions_ptr, session_count as _);
-    }
-
-    let mut active_session_id = user_sessions
-        .into_iter()
-        .find(|session| session.State == WTSActive)
-        .map(|session| session.SessionId)
-        .unwrap_or(0);
-    unsafe {
-        WTSFreeMemory(sessions_ptr as _);
-    }
-
-    if active_session_id != 0 {
-        return Ok(ProcessFlowInstruction::Continue(active_session_id));
-    }
-
-    active_session_id = unsafe { WTSGetActiveConsoleSessionId() };
-    Ok(ProcessFlowInstruction::Continue(active_session_id))
-}
-
 fn launch_process(
-    mut args: Arguments,
+    args: Arguments,
     target_access_token: WrappedHandle<ProcessToken>,
 ) -> Result<ProcessFlowInstruction<()>> {
-    println!("Token handle value {:?}", target_access_token);
+    let mut process_security_attributes = SECURITY_ATTRIBUTES::default();
+    process_security_attributes.nLength = size_of_val(&process_security_attributes) as _;
+    process_security_attributes.bInheritHandle = true.into();
+    process_security_attributes.lpSecurityDescriptor = ptr::null_mut();
 
-    todo!()
+    let mut startup_info = STARTUPINFOW::default();
+    startup_info.cb = size_of_val(&startup_info) as _;
+
+    let mut command_line = match create_command_line_widestring(&args.command_line) {
+        Some(command_line) => command_line,
+        None => {
+            return Err(eyre!("No command provided"));
+        }
+    };
+
+    println!(
+        "Command line: {:?}",
+        char::decode_utf16(command_line.clone())
+            .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect::<String>()
+    );
+
+    // TODO; Cannot inherit handles accross sessions
+    process_security_attributes.bInheritHandle = false.into();
+
+    let environment = None;
+    let current_directory = None;
+
+    println!("Child setup completed!");
+
+    let impersonation = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
+
+    let current_thread = WrappedHandle::new_from_current_thread()?;
+    let thread_token =
+        current_thread.new_token((TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY).0, false)?;
+    unsafe {
+        enable_privilege(&thread_token, SE_INCREASE_QUOTA_NAME)?;
+        enable_privilege(&thread_token, SE_ASSIGNPRIMARYTOKEN_NAME)?;
+    }
+
+    // ERROR; We cannot discretely check if the target access token has the access right "TOKEN_ASSIGN_PRIMARY"! This is NOT the same as token privileges!
+    // Options are to open the token with desires access mask, or performing an operation on the token that requires the specific right and _guess_ a specific right is missing.
+    // The token filter providing us our target access token must include TOKEN_ASSIGN_PRIMARY!
+
+    let mut process_info = PROCESS_INFORMATION::default();
+    unsafe {
+        match CreateProcessAsUserW(
+            *target_access_token.get(),
+            None,
+            PWSTR::from_raw(command_line.as_mut_ptr()),
+            Some(&process_security_attributes),
+            Some(&process_security_attributes),
+            (startup_info.dwFlags & STARTF_USESTDHANDLES) == STARTF_USESTDHANDLES,
+            PROCESS_CREATION_FLAGS(0),
+            environment,
+            current_directory,
+            &mut startup_info,
+            &mut process_info,
+        )
+        .ok()
+        {
+            Ok(_) => { /* OK */ }
+            Err(error) => match WIN32_ERROR::from_error(&error) {
+                Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                    return Err(error).wrap_err("Hit the ERROR_PRIVILEGE_NOT_HELD")?;
+                }
+                _ => return Err(error).wrap_err("During child process execution")?,
+            },
+        };
+    };
+
+    impersonation.revert()?;
+    println!("Started the process successfully!");
+
+    if let Some(wait_millis) = args.wait_for_child {
+        println!("Waiting for child process to exit");
+        unsafe {
+            match WaitForSingleObject(process_info.hProcess, wait_millis) {
+                WAIT_OBJECT_0 => {
+                    println!("Child process has exited!");
+                }
+                WAIT_TIMEOUT => {
+                    println!("Timeout waiting for child process to exit!");
+                }
+                e => e.ok()?, // Actual error
+            }
+        }
+    }
+
+    let handles_to_close = [
+        process_info.hProcess,
+        process_info.hThread,
+        startup_info.hStdInput,
+        startup_info.hStdOutput,
+        startup_info.hStdError,
+    ];
+    // WARN; Handles might be aliased!
+    let mut closed = Vec::with_capacity(handles_to_close.len());
+    unsafe {
+        for handle in handles_to_close.into_iter() {
+            if closed.contains(&handle) {
+                continue;
+            }
+
+            CloseHandle(handle);
+            closed.push(handle);
+        }
+    }
+
+    println!("Finished!");
+
+    Ok(ProcessFlowInstruction::Terminate)
+}
+
+#[cfg(test)]
+mod test {
+    use std::{ffi::OsString, str::FromStr};
+
+    use magixui::ProcessFlowInstruction;
+
+    use crate::{build_target_access_token, launch_process, Arguments, OperationModeBuilder};
+
+    #[test]
+    fn test_user() {
+        let command_line: Vec<OsString> =
+            vec!["C:\\WINDOWS\\system32\\cmd.exe".into(), "/C".into(), "whoami".into()];
+        let mut builder = OperationModeBuilder::new();
+        builder.push("user".into()).unwrap();
+        builder.push("bert".into()).unwrap();
+
+        let mut arguments = Arguments {
+            mode: builder.build().unwrap(),
+            wait_for_child: None,
+            process_name_filter: None,
+            command_line,
+        };
+
+        let ProcessFlowInstruction::Continue(access_token) =
+            build_target_access_token(&mut arguments).unwrap()
+        else {
+            unreachable!()
+        };
+        launch_process(arguments, access_token).unwrap();
+    }
 }
