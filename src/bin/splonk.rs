@@ -1,26 +1,35 @@
 use std::ffi::{OsStr, OsString};
+use std::hint::black_box;
 use std::mem::{self, size_of, size_of_val};
+use std::ops::Shl;
 use std::os::windows::prelude::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::ptr::{self, addr_of_mut};
 use std::slice::{self, from_raw_parts};
+use std::thread::current;
 
 use color_eyre::eyre::{eyre, Context, Result};
+use lexopt::Arg;
 use magixui::{
     contains_wide, create_command_line_widestring, enable_privilege, Process,
     ProcessFlowInstruction, ProcessSnapshot, ProcessToken, SIDError, TokenInformation,
     WrappedHandle, WrappedImpersonation, WrappedSID,
 };
 use thiserror::Error;
-use windows::core::PWSTR;
+use windows::core::{w, Error, HRESULT, PWSTR};
+use windows::Wdk::Foundation::{NtQueryObject, ObjectTypeInformation};
+use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_PRIVILEGE_NOT_HELD, WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_PRIVILEGE_NOT_HELD, HANDLE, STATUS_INFO_LENGTH_MISMATCH, STATUS_NO_MEMORY,
+    STATUS_SUCCESS, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
 };
 use windows::Win32::Security::{
-    DuplicateTokenEx, EqualSid, LookupAccountNameW, SecurityImpersonation, TokenPrimary,
-    SECURITY_ATTRIBUTES, SE_ASSIGNPRIMARYTOKEN_NAME, SE_DEBUG_NAME, SE_INCREASE_QUOTA_NAME,
-    TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_QUERY_SOURCE, TOKEN_USER,
+    DuplicateTokenEx, EqualSid, ImpersonateSelf, LookupAccountNameW, SecurityImpersonation,
+    TokenPrimary, SECURITY_ATTRIBUTES, SE_ASSIGNPRIMARYTOKEN_NAME, SE_DEBUG_NAME,
+    SE_INCREASE_QUOTA_NAME, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TOKEN_QUERY_SOURCE, TOKEN_USER,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -32,9 +41,13 @@ use windows::Win32::System::RemoteDesktop::{
 };
 use windows::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, QueryFullProcessImageNameW, WaitForSingleObject, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessAsUserW, GetCurrentProcess, OpenProcess, QueryFullProcessImageNameW,
+    WaitForSingleObject, PROCESS_CREATION_FLAGS, PROCESS_DUP_HANDLE, PROCESS_INFORMATION,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOW,
+};
+use windows::Win32::System::WindowsProgramming::{
+    PUBLIC_OBJECT_TYPE_INFORMATION, SYSTEM_BASIC_INFORMATION,
 };
 use windows::Win32::System::{
     RemoteDesktop::{WTSEnumerateSessionsW, WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW},
@@ -314,6 +327,252 @@ fn match_process_basename(path: &Path, needle: &OsString) -> bool {
         .is_some_and(|result| result == true)
 }
 
+#[repr(C)]
+pub struct SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    pub ProcessId: u16,
+    pub CreatorBackTraceIndex: u16,
+    pub ObjectTypeIndex: u8,
+    pub HandleAttributes: u8,
+    pub HandleValue: u16,
+    pub Object: *mut std::ffi::c_void,
+    pub GrantedAccess: u32,
+}
+
+impl ::core::marker::Copy for SYSTEM_HANDLE_TABLE_ENTRY_INFO {}
+impl ::core::clone::Clone for SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl ::core::fmt::Debug for SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("SYSTEM_HANDLE_TABLE_ENTRY_INFO")
+            .field("ProcessId", &self.ProcessId)
+            .field("CreatorBackTraceIndex", &self.CreatorBackTraceIndex)
+            .field("ObjectTypeIndex", &self.ObjectTypeIndex)
+            .field("HandleAttributes", &self.HandleAttributes)
+            .field("HandleValue", &self.HandleValue)
+            .field("Object", &self.Object)
+            .field("GrantedAccess", &self.GrantedAccess)
+            .finish()
+    }
+}
+
+impl windows::core::TypeKind for SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    type TypeKind = windows::core::CopyType;
+}
+
+impl ::core::cmp::PartialEq for SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    fn eq(&self, other: &Self) -> bool {
+        self.ProcessId == other.ProcessId
+            && self.CreatorBackTraceIndex == other.CreatorBackTraceIndex
+            && self.ObjectTypeIndex == other.ObjectTypeIndex
+            && self.HandleAttributes == other.HandleAttributes
+            && self.HandleValue == other.HandleValue
+            && self.Object == other.Object
+            && self.GrantedAccess == other.GrantedAccess
+    }
+}
+
+impl ::core::cmp::Eq for SYSTEM_HANDLE_TABLE_ENTRY_INFO {}
+
+impl ::core::default::Default for SYSTEM_HANDLE_TABLE_ENTRY_INFO {
+    fn default() -> Self {
+        unsafe { ::core::mem::zeroed() }
+    }
+}
+
+#[repr(C)]
+pub struct SYSTEM_HANDLE_INFORMATION {
+    pub NumberOfHandles: u32,
+    pub Handles: [SYSTEM_HANDLE_TABLE_ENTRY_INFO; 1],
+}
+
+impl ::core::marker::Copy for SYSTEM_HANDLE_INFORMATION {}
+impl ::core::clone::Clone for SYSTEM_HANDLE_INFORMATION {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl ::core::fmt::Debug for SYSTEM_HANDLE_INFORMATION {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        f.debug_struct("SYSTEM_HANDLE_INFORMATION")
+            .field("NumberOfHandles", &self.NumberOfHandles)
+            .field("Handles", &self.Handles)
+            .finish()
+    }
+}
+
+impl windows::core::TypeKind for SYSTEM_HANDLE_INFORMATION {
+    type TypeKind = windows::core::CopyType;
+}
+
+impl ::core::cmp::PartialEq for SYSTEM_HANDLE_INFORMATION {
+    fn eq(&self, other: &Self) -> bool {
+        self.NumberOfHandles == other.NumberOfHandles && self.Handles == other.Handles
+    }
+}
+
+impl ::core::cmp::Eq for SYSTEM_HANDLE_INFORMATION {}
+impl ::core::default::Default for SYSTEM_HANDLE_INFORMATION {
+    fn default() -> Self {
+        unsafe { ::core::mem::zeroed() }
+    }
+}
+
+fn build_target_access_token_ntsystem(
+    args: &mut Arguments,
+) -> Result<ProcessFlowInstruction<WrappedHandle<ProcessToken>>> {
+    let impersonation = WrappedImpersonation::impersonate_self(SecurityImpersonation.0)?;
+    let current_thread = WrappedHandle::new_from_current_thread()?;
+    let thread_token =
+        current_thread.new_token((TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY).0, false)?;
+
+    let system_handle_information = SYSTEM_INFORMATION_CLASS(16);
+    let mut required_size = 0x400;
+    let mut information_buffer = Vec::<u8>::with_capacity(required_size as _);
+
+    loop {
+        unsafe {
+            // ERROR; Handle table will change between calls to kernel, so a static approach to buffer size
+            // is not optimal.
+            match NtQuerySystemInformation(
+                system_handle_information,
+                information_buffer.as_mut_ptr().cast(),
+                required_size.clone(),
+                &mut required_size,
+            ) {
+                Ok(_) => break,
+                Err(error) if error.code() == STATUS_INFO_LENGTH_MISMATCH.to_hresult() => {
+                    required_size = required_size
+                        .checked_shl(1)
+                        .expect("Integer overflow at NtQuerySystemInformation");
+                    // NOTE; Works because vector length is always 0
+                    information_buffer.reserve(required_size as _);
+                }
+                Err(error) => Err(error)?,
+            }
+        };
+    }
+
+    let header_handles_information =
+        unsafe { &*(information_buffer.as_ptr() as *const SYSTEM_HANDLE_INFORMATION) };
+    assert_eq!(
+        required_size as usize,
+        (size_of::<SYSTEM_HANDLE_INFORMATION>() - size_of::<SYSTEM_HANDLE_TABLE_ENTRY_INFO>()
+            + (header_handles_information.NumberOfHandles as usize
+                * size_of::<SYSTEM_HANDLE_TABLE_ENTRY_INFO>())),
+        "Type definition mismatch at SYSTEM_HANDLE_TABLE_ENTRY_INFO!"
+    );
+
+    let handles = unsafe {
+        slice::from_raw_parts(
+            header_handles_information.Handles.as_ptr(),
+            header_handles_information.NumberOfHandles as _,
+        )
+    };
+
+    for handle_info in handles {
+        eprintln!("Attempt opening process {0}", handle_info.ProcessId);
+        // If we can open the process owning the handle, we can open the handle.
+        let process = unsafe {
+            match OpenProcess(PROCESS_DUP_HANDLE, false, handle_info.ProcessId as _) {
+                Ok(handle) => WrappedHandle::new(handle),
+                Err(_) => continue,
+            }
+        };
+
+        eprintln!("Attempt copying token");
+        // Copy handle into our own process domain
+        let target_handle = unsafe {
+            let mut handle = HANDLE::default();
+            match DuplicateHandle(
+                *process.get(),
+                HANDLE(handle_info.HandleValue as _),
+                GetCurrentProcess(),
+                &mut handle,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            ) {
+                Ok(_) => { /* Do nothing */ }
+                Err(_) => continue,
+            };
+            WrappedHandle::<ProcessToken>::new(handle)
+        };
+
+        // Filter handle for desired usecase
+        let mut required_size = 0;
+        unsafe {
+            match NtQueryObject(
+                *target_handle.get(),
+                ObjectTypeInformation,
+                None,
+                0,
+                Some(&mut required_size),
+            ) {
+                Ok(_) => unreachable!("This API call is setup to fail!"),
+                Err(error) if error.code() == STATUS_INFO_LENGTH_MISMATCH.to_hresult() => {
+                    /* Expected error */
+                }
+                Err(error) => Err(error)?,
+            }
+        };
+
+        let mut handle_type_buffer = Vec::<u8>::with_capacity(required_size as usize);
+        unsafe {
+            NtQueryObject(
+                *target_handle.get(),
+                ObjectTypeInformation,
+                Some(handle_type_buffer.as_mut_ptr().cast()),
+                required_size.clone(),
+                Some(&mut required_size),
+            )
+            .wrap_err("While retrieving token type information")?
+        };
+        let header_handle_type =
+            unsafe { &*(handle_type_buffer.as_ptr() as *const PUBLIC_OBJECT_TYPE_INFORMATION) };
+        if header_handle_type.TypeName.Length == 0 || header_handle_type.TypeName.Buffer.0.is_null()
+        {
+            continue;
+        }
+
+        let type_nameslice = unsafe {
+            slice::from_raw_parts(
+                header_handle_type.TypeName.Buffer.0,
+                // WARN; Length is expressed in BYTES!
+                // WARN; Length is expressed WITHOUT null-terminator
+                header_handle_type
+                    .TypeName
+                    .Length
+                    .checked_div(2)
+                    .expect("Integer Underflow at TOKEN_TYPENAME") as _,
+            )
+        };
+        // NOTE; encode_utf16 doesn't add a null-terminator
+        let token_type_string: Vec<_> = "Token".encode_utf16().collect();
+        println!("{0}", handle_info.ProcessId);
+        println!("{:02X?}", &token_type_string);
+        println!("{:02X?}", type_nameslice);
+        if type_nameslice != &token_type_string {
+            continue;
+        }
+
+        struct TokenDetails {
+            Handle: WrappedHandle,
+            Username: OsStr,
+        }
+
+        TokenInformation::<TOKEN_USER>::new(&target_handle)?;
+
+        todo!("Parse handle as an ACCESS TOKEN and do stuffs");
+    }
+
+    unimplemented!()
+}
+
 fn build_target_access_token(
     args: &mut Arguments,
 ) -> Result<ProcessFlowInstruction<WrappedHandle<ProcessToken>>> {
@@ -442,9 +701,7 @@ fn launch_process(
             current_directory,
             &mut startup_info,
             &mut process_info,
-        )
-        .ok()
-        {
+        ) {
             Ok(_) => { /* OK */ }
             Err(error) => match WIN32_ERROR::from_error(&error) {
                 Some(ERROR_PRIVILEGE_NOT_HELD) => {
@@ -468,7 +725,10 @@ fn launch_process(
                 WAIT_TIMEOUT => {
                     println!("Timeout waiting for child process to exit!");
                 }
-                e => e.ok()?, // Actual error
+                e => Err(eyre!(
+                    "Unexpected error {0:?} while waiting for child process to exit",
+                    e.0
+                ))?,
             }
         }
     }
@@ -488,7 +748,7 @@ fn launch_process(
                 continue;
             }
 
-            CloseHandle(handle);
+            let _ = CloseHandle(handle);
             closed.push(handle);
         }
     }
@@ -502,9 +762,13 @@ fn launch_process(
 mod test {
     use std::{ffi::OsString, str::FromStr};
 
+    use color_eyre::eyre::{eyre, Context, Result};
     use magixui::ProcessFlowInstruction;
 
-    use crate::{build_target_access_token, launch_process, Arguments, OperationModeBuilder};
+    use crate::{
+        build_target_access_token, build_target_access_token_ntsystem, launch_process, Arguments,
+        OperationModeBuilder,
+    };
 
     #[test]
     fn test_user() {
@@ -527,5 +791,27 @@ mod test {
             unreachable!()
         };
         launch_process(arguments, access_token).unwrap();
+    }
+
+    #[test]
+    fn test_ntsystem() -> Result<()> {
+        let command_line: Vec<OsString> =
+            vec!["C:\\WINDOWS\\system32\\cmd.exe".into(), "/C".into(), "whoami".into()];
+        let mut builder = OperationModeBuilder::new();
+        builder.push("user".into()).unwrap();
+        builder.push("bert".into()).unwrap();
+
+        let mut arguments = Arguments {
+            mode: builder.build().unwrap(),
+            wait_for_child: None,
+            process_name_filter: None,
+            command_line,
+        };
+
+        match build_target_access_token_ntsystem(&mut arguments) {
+            Ok(_) => {}
+            Err(error) => Err(error)?,
+        };
+        Ok(())
     }
 }

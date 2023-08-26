@@ -13,19 +13,18 @@ use std::{
 
 use thiserror::Error;
 use windows::{
-    core::{Error, PCWSTR, PWSTR},
-    w,
+    core::{w, Error, PCWSTR, PWSTR},
     Win32::{
         Foundation::{
             CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
-            ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_MORE_FILES, ERROR_NO_TOKEN, HANDLE, PSID,
+            ERROR_NO_IMPERSONATION_TOKEN, ERROR_NO_MORE_FILES, ERROR_NO_TOKEN, HANDLE, PSID, S_OK,
             WIN32_ERROR,
         },
         Security::{
             AdjustTokenPrivileges, DuplicateTokenEx, EqualSid, GetTokenInformation,
-            ImpersonateSelf, LookupAccountNameW, LookupPrivilegeValueW, RevertToSelf,
-            SecurityImpersonation, TokenGroups, TokenPrimary, TokenPrivileges, TokenUser,
-            LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
+            ImpersonateSelf, LookupAccountNameW, LookupAccountSidW, LookupPrivilegeValueW,
+            RevertToSelf, SecurityImpersonation, TokenGroups, TokenPrimary, TokenPrivileges,
+            TokenUser, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
             SE_PRIVILEGE_ENABLED, SE_PRIVILEGE_ENABLED_BY_DEFAULT, SID_AND_ATTRIBUTES,
             SID_NAME_USE, TOKEN_ACCESS_MASK, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
             TOKEN_PRIVILEGES, TOKEN_USER,
@@ -35,9 +34,10 @@ use windows::{
                 CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
                 TH32CS_SNAPPROCESS,
             },
+            RemoteDesktop::ProcessIdToSessionId,
             SystemServices::MAXIMUM_ALLOWED,
             Threading::{
-                GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken,
+                GetCurrentProcess, GetCurrentThread, GetProcessId, OpenProcess, OpenProcessToken,
                 OpenThreadToken, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS,
                 PROCESS_NAME_WIN32,
             },
@@ -147,7 +147,7 @@ impl WrappedImpersonation {
     pub fn impersonate_self(
         impersonation_level: i32,
     ) -> Result<ImpersonationGuard, ImpersonationError> {
-        match unsafe { ImpersonateSelf(SECURITY_IMPERSONATION_LEVEL(impersonation_level)).ok() } {
+        match unsafe { ImpersonateSelf(SECURITY_IMPERSONATION_LEVEL(impersonation_level)) } {
             Ok(_) => Ok(ImpersonationGuard { dropped: false }),
             Err(error) => Err(error)?,
         }
@@ -157,7 +157,7 @@ impl WrappedImpersonation {
 impl ImpersonationGuard {
     pub fn revert(mut self) -> Result<(), ImpersonationError> {
         if mem::replace(&mut self.dropped, true) == false {
-            unsafe { RevertToSelf().ok()? };
+            unsafe { RevertToSelf()? };
         }
 
         Ok(())
@@ -167,7 +167,7 @@ impl ImpersonationGuard {
 impl Drop for ImpersonationGuard {
     fn drop(&mut self) {
         if mem::replace(&mut self.dropped, true) == false {
-            if let Err(error) = unsafe { RevertToSelf().ok() } {
+            if let Err(error) = unsafe { RevertToSelf() } {
                 panic!(
                     "RevertToSelf call failed, aborting thread now! Error message {0}",
                     error.message()
@@ -219,15 +219,13 @@ pub unsafe fn enable_privilege(
     };
 
     LookupPrivilegeValueW(None, privilege_to_enable, &mut privilege_wrapper.Privileges[0].Luid)
-        .ok()
         .map_err(|_| {
             let privilege_string =
                 privilege_to_enable.to_string().unwrap_or_else(|_| "[Decode error]".into());
             PrivilegeError::InvalidPrivilegeName(privilege_string)
         })?;
 
-    unsafe { AdjustTokenPrivileges(*token.get(), false, Some(&privilege_wrapper), 0, None, None) }
-        .ok()?;
+    unsafe { AdjustTokenPrivileges(*token.get(), false, Some(&privilege_wrapper), 0, None, None)? };
 
     // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
     // status of the _request_ but not if all privileges are set. That's why a second test is needed!
@@ -255,10 +253,9 @@ pub unsafe fn disable_privilege(
         }],
     };
 
-    LookupPrivilegeValueW(None, privilege_to_disable, &mut privilege_wrapper.Privileges[0].Luid)
-        .ok()?;
+    LookupPrivilegeValueW(None, privilege_to_disable, &mut privilege_wrapper.Privileges[0].Luid)?;
 
-    AdjustTokenPrivileges(*handle.get(), false, Some(&privilege_wrapper), 0, None, None).ok()?;
+    AdjustTokenPrivileges(*handle.get(), false, Some(&privilege_wrapper), 0, None, None)?;
 
     // ERROR; Need to double-check the set permissions! "AdjustTokenPrivileges" returns
     // status of the _request_ but not if all privileges are set. That's why a second test is needed!
@@ -341,20 +338,17 @@ impl WrappedHandle<Process> {
     ) -> Result<WrappedHandle<ProcessToken>, WrappedHandleError> {
         let mut handle: HANDLE = Default::default();
         unsafe {
-            if let Err(error) =
-                OpenProcessToken(self.handle, TOKEN_ACCESS_MASK(token_access_rights), &mut handle)
-                    .ok()
+            match OpenProcessToken(self.handle, TOKEN_ACCESS_MASK(token_access_rights), &mut handle)
             {
-                match WIN32_ERROR::from_error(&error) {
+                Ok(_) => Ok(WrappedHandle { handle, _phantom: PhantomData }),
+                Err(error) => match WIN32_ERROR::from_error(&error) {
                     Some(ERROR_NO_TOKEN) | Some(ERROR_NO_IMPERSONATION_TOKEN) => {
-                        Err(WrappedHandleError::NoThreadTokenSet)?
+                        Err(WrappedHandleError::NoThreadTokenSet)
                     }
                     _ => Err(error)?,
-                }
+                },
             }
-        };
-
-        Ok(WrappedHandle { handle, _phantom: PhantomData })
+        }
     }
 
     pub fn get_process_image_path(&self) -> Result<PathBuf, WrappedHandleError> {
@@ -369,9 +363,7 @@ impl WrappedHandle<Process> {
                     PROCESS_NAME_WIN32,
                     PWSTR::from_raw(buffer.as_mut_ptr()),
                     &mut available_codepoints,
-                )
-                .ok()
-                {
+                ) {
                     Ok(_) => break,
                     Err(error) => match WIN32_ERROR::from_error(&error) {
                         Some(ERROR_INSUFFICIENT_BUFFER) => { /* Expected error */ }
@@ -393,9 +385,25 @@ impl WrappedHandle<Process> {
         let wide_string = OsString::from_wide(unsafe { wide_string.as_wide() });
         Ok(PathBuf::from(wide_string))
     }
+
+    pub fn get_session_id(&self) -> Result<u32, WrappedHandleError> {
+        let process_id = unsafe { GetProcessId(self.handle) };
+        let error = Error::from_win32();
+        if error.code() != S_OK {
+            return Err(error)?;
+        }
+
+        let mut session_id = 0;
+        unsafe { ProcessIdToSessionId(process_id, &mut session_id)? };
+        Ok(session_id)
+    }
 }
 
 impl WrappedHandle<ProcessToken> {
+    pub unsafe fn new(handle: HANDLE) -> Self {
+        Self { handle, _phantom: PhantomData }
+    }
+
     pub fn duplicate_impersonation(&self) -> Result<Self, WrappedHandleError> {
         let mut security_attributes = SECURITY_ATTRIBUTES::default();
         security_attributes.nLength = size_of_val(&security_attributes)
@@ -412,8 +420,7 @@ impl WrappedHandle<ProcessToken> {
                 SecurityImpersonation,
                 TokenPrimary,
                 &mut duplicated_handle,
-            )
-            .ok()?;
+            )?;
         }
 
         Ok(Self { handle: duplicated_handle, _phantom: PhantomData })
@@ -433,8 +440,7 @@ impl WrappedHandle<Thread> {
                 TOKEN_ACCESS_MASK(token_access_rights),
                 !open_with_impersonation,
                 &mut handle,
-            )
-            .ok()?
+            )?
         };
 
         Ok(WrappedHandle { handle, _phantom: PhantomData })
@@ -487,9 +493,7 @@ impl<Class: TokenClass> TokenInformation<Class> {
     pub fn new(handle: &WrappedHandle<ProcessToken>) -> Result<Self, TokenInformationError> {
         let mut required_size = 0;
         unsafe {
-            match GetTokenInformation(*handle.get(), Class::class(), None, 0, &mut required_size)
-                .ok()
-            {
+            match GetTokenInformation(*handle.get(), Class::class(), None, 0, &mut required_size) {
                 Ok(_) => unreachable!("This API call is setup to fail!"),
                 Err(error) => match WIN32_ERROR::from_error(&error) {
                     Some(ERROR_INSUFFICIENT_BUFFER) => { /* Expected error */ }
@@ -506,8 +510,7 @@ impl<Class: TokenClass> TokenInformation<Class> {
                 Some(info_buffer.as_mut_ptr().cast()),
                 required_size,
                 &mut 0,
-            )
-            .ok()?;
+            )?;
         }
 
         Ok(Self { info_buffer, _phantom: PhantomData::default() })
@@ -538,7 +541,7 @@ impl TokenInformation<TOKEN_PRIVILEGES> {
     pub fn has_privilege(&self, privilege: &PCWSTR) -> Result<bool, PrivilegeError> {
         let mut local_uid = Default::default();
         unsafe {
-            LookupPrivilegeValueW(None, *privilege, &mut local_uid).ok().map_err(|_| {
+            LookupPrivilegeValueW(None, *privilege, &mut local_uid).map_err(|_| {
                 let privilege_string =
                     privilege.to_string().unwrap_or_else(|_| "[Decode error]".into());
                 PrivilegeError::InvalidPrivilegeName(privilege_string)
@@ -555,6 +558,28 @@ impl TokenInformation<TOKEN_PRIVILEGES> {
     pub fn get_privileges(&self) -> &[LUID_AND_ATTRIBUTES] {
         let object = self.as_ref();
         unsafe { from_raw_parts(object.Privileges.as_ptr(), object.PrivilegeCount as _) }
+    }
+}
+
+impl TokenInformation<TOKEN_USER> {
+    pub fn get_username(&self) -> Result<OsString, TokenInformationError> {
+        let object = self.as_ref();
+        let mut required_username_size = 0;
+        let mut required_domain_size = 0;
+        let mut name_usage = SID_NAME_USE::default();
+        unsafe {
+            LookupAccountSidW(
+                PCWSTR::null(),
+                object.User.Sid,
+                PWSTR::null(),
+                &mut required_username_size,
+                PWSTR::null(),
+                &mut required_domain_size,
+                &mut name_usage,
+            )
+        };
+
+        todo!()
     }
 }
 
@@ -584,9 +609,7 @@ impl WrappedSID {
                 PWSTR::null(),
                 &mut host_required_characters,
                 &mut sid_usage,
-            )
-            .ok()
-            {
+            ) {
                 Ok(_) => unreachable!("This API call is setup to fail!"),
                 Err(error) => match WIN32_ERROR::from_error(&error) {
                     Some(ERROR_INSUFFICIENT_BUFFER) => { /* Expected error */ }
@@ -609,8 +632,7 @@ impl WrappedSID {
                 PWSTR::from_raw(host_info_buffer.as_mut_ptr()),
                 &mut host_required_characters,
                 &mut sid_usage,
-            )
-            .ok()?;
+            )?;
         }
 
         sid_info_buffer.set_len(sid_required_size as usize);
@@ -627,7 +649,7 @@ impl PartialEq for WrappedSID {
 impl PartialEq<PSID> for WrappedSID {
     fn eq(&self, other: &PSID) -> bool {
         let self_sid = PSID(self.info_buffer.as_ptr().cast_mut().cast());
-        unsafe { EqualSid(self_sid, *other).into() }
+        unsafe { EqualSid(self_sid, *other).is_ok() }
     }
 }
 
@@ -669,7 +691,7 @@ impl Iterator for ProcessSnapshot {
             true => unsafe { Process32NextW(*self.snapshot_handle.get(), &mut current_entry) },
         };
 
-        match internal_operation.ok() {
+        match internal_operation {
             Ok(_) => { /* No issue */ }
             Err(internal_error) => match WIN32_ERROR::from_error(&internal_error) {
                 Some(ERROR_NO_MORE_FILES) => return None,
